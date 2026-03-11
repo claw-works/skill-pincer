@@ -195,7 +195,7 @@ async def handle_message(raw: str, cfg: dict, agent_id: str, ws, dry_run: bool) 
         else:
             log.info("✓ Authenticated with Pincer hub.")
 
-    elif msg_type == "TASK_ASSIGN":
+    elif msg_type in ("TASK_ASSIGN", "task.assigned"):
         task_id = payload.get("task_id", "?")
         title = payload.get("title", "")
         description = payload.get("description", "")
@@ -217,13 +217,13 @@ async def handle_message(raw: str, cfg: dict, agent_id: str, ws, dry_run: bool) 
         )
         forward_to_agent(cfg, context, dry_run)
 
-    elif msg_type == "MESSAGE":
+    elif msg_type in ("MESSAGE", "agent.message"):
         from_id = msg.get("from", "?")
         text = payload.get("text", "")
         log.info("💬 DM from %s: %s", from_id[:8], text[:80])
         forward_to_agent(cfg, f"[Pincer DM from {from_id}]\n{text}", dry_run)
 
-    elif msg_type in ("broadcast", "BROADCAST"):
+    elif msg_type in ("broadcast", "BROADCAST", "hub.broadcast"):
         text = payload.get("text", str(payload))
         log.info("📢 Broadcast: %s", text[:80])
 
@@ -236,7 +236,7 @@ async def handle_message(raw: str, cfg: dict, agent_id: str, ws, dry_run: bool) 
             log.info("📬 Inbox from %s", from_id[:8])
             forward_to_agent(cfg, f"[Pincer Inbox from {from_id}]\n{text}", dry_run)
 
-    elif msg_type == "HEARTBEAT_ACK":
+    elif msg_type in ("HEARTBEAT_ACK", "heartbeat.ack"):
         inbox = payload.get("inbox") or []
         if inbox:
             log.info("📬 %d inbox message(s) via heartbeat ACK", len(inbox))
