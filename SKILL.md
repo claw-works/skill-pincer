@@ -65,11 +65,21 @@ Write `~/.openclaw/pincer-daemon.json`:
   "pincer_url": "wss://your-pincer-host/ws",
   "api_key": "your-api-key",
   "agent_id": "your-agent-uuid",
-  "agent_name": "your-name",
+  "agent_name": "YourName",
   "capabilities": ["coding", "go", "devops"],
+  "session_key": "",
   "openclaw_bin": "openclaw"
 }
 ```
+
+Fields:
+- `pincer_url` — WebSocket URL, e.g. `wss://host/ws` or `ws://10.0.x.x:8080/ws`
+- `api_key` — Pincer API key
+- `agent_id` — your registered agent UUID
+- `agent_name` — **required** display name
+- `capabilities` — list of capability tags
+- `session_key` — OpenClaw session to wake (leave empty to use the default main session)
+- `openclaw_bin` — path to the `openclaw` binary (default: `openclaw`)
 
 Read your OpenClaw gateway token (needed for future gateway forwarding):
 ```bash

@@ -2,8 +2,8 @@
   "pincer_url": "wss://your-pincer-host/ws",
   "api_key": "your-api-key-here",
   "agent_id": "your-agent-uuid-here",
-  "agent_name": "蔻儿",
-  "capabilities": ["coding", "go", "devops", "architecture", "fullstack", "feishu"],
-  "openclaw_gateway_url": "ws://127.0.0.1:18789",
-  "openclaw_gateway_token": "your-gateway-token-here"
+  "agent_name": "YourAgentName",
+  "capabilities": ["coding", "go", "devops"],
+  "session_key": "",
+  "openclaw_bin": "openclaw"
 }

@@ -11,6 +11,7 @@ Usage:
 
 import argparse
 import asyncio
+import collections
 import json
 import logging
 import os
@@ -26,7 +27,7 @@ from pathlib import Path
 try:
     import websockets
 except ImportError:
-    print("Missing dependency: pip3 install websockets", file=sys.stderr)
+    print("Missing dependency: python3 -m pip install websockets", file=sys.stderr)
     sys.exit(1)
 
 logging.basicConfig(
@@ -40,6 +41,7 @@ DEFAULT_CONFIG_PATH = os.path.expanduser("~/.openclaw/pincer-daemon.json")
 HEARTBEAT_INTERVAL = 30   # seconds
 RECONNECT_DELAY_BASE = 5
 RECONNECT_DELAY_MAX = 60
+SEEN_MAXLEN = 1000        # max entries in result listener seen-set (#6)
 
 # Result queue: agent writes results here, send loop picks them up
 _result_queue: queue.Queue = queue.Queue()
@@ -56,13 +58,14 @@ def load_config(path: str) -> dict:
         if not cfg.get(key):
             raise ValueError(f"Missing required config key: {key}")
     cfg.setdefault("capabilities", [])
-    cfg.setdefault("session_key", "agent:main:pincer:tasks")
+    # session_key: empty string means "use openclaw default" (#2)
+    cfg.setdefault("session_key", "")
     cfg.setdefault("openclaw_bin", "openclaw")
     return cfg
 
 
 # ---------------------------------------------------------------------------
-# OpenClaw forwarding — invoke agent via CLI
+# OpenClaw forwarding — invoke agent via CLI (#2 fix: session_key optional)
 # ---------------------------------------------------------------------------
 
 def forward_to_agent(cfg: dict, message: str, dry_run: bool = False) -> None:
@@ -71,18 +74,21 @@ def forward_to_agent(cfg: dict, message: str, dry_run: bool = False) -> None:
         log.info("[DRY RUN] Would forward to OpenClaw:\n  %s", message[:200])
         return
 
-    session_key = cfg["session_key"]
     bin_ = cfg["openclaw_bin"]
+    session_key = cfg.get("session_key", "").strip()
 
-    cmd = [bin_, "sessions", "send", "--session-key", session_key, "--message", message]
+    # Build command — omit --session-key if not configured so openclaw
+    # routes to the default main session (#2)
+    cmd = [bin_, "sessions", "send", "--message", message]
+    if session_key:
+        cmd = [bin_, "sessions", "send", "--session-key", session_key, "--message", message]
+
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=30
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
             log.warning("sessions send failed (rc=%d): %s", result.returncode, result.stderr[:200])
         else:
-            log.info("Forwarded to OpenClaw agent (session=%s)", session_key)
+            log.info("Forwarded to OpenClaw agent")
     except FileNotFoundError:
         log.error("openclaw binary not found at: %s", bin_)
     except subprocess.TimeoutExpired:
@@ -90,28 +96,36 @@ def forward_to_agent(cfg: dict, message: str, dry_run: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Result queue — agent posts results back to this queue
+# Result queue — agent drops result files, daemon picks them up (#6 fix)
 # ---------------------------------------------------------------------------
 
 def result_listener_thread(result_dir: Path) -> None:
     """
     Watch a directory for result files dropped by the agent.
-    Each file is a JSON: {"task_id": "...", "status": "done"|"failed", "result": "..."}
+    Each file is JSON: {"task_id": "...", "status": "done"|"failed", "result": "..."}
+    Also supports progress updates: {"task_id": "...", "status": "running", "message": "..."}
     """
     result_dir.mkdir(parents=True, exist_ok=True)
-    seen: set = set()
+    seen: collections.deque = collections.deque(maxlen=SEEN_MAXLEN)  # bounded (#6)
+    seen_set: set = set()
+
     while True:
         try:
             for f in sorted(result_dir.glob("*.json")):
-                if f.name in seen:
+                if f.name in seen_set:
                     continue
-                seen.add(f.name)
+                seen.append(f.name)
+                seen_set.add(f.name)
+                # Evict oldest if deque wrapped
+                while len(seen_set) > SEEN_MAXLEN:
+                    oldest = seen.popleft()
+                    seen_set.discard(oldest)
                 try:
                     data = json.loads(f.read_text())
                     _result_queue.put(data)
                     log.info("📤 Result queued: task_id=%s status=%s",
                              data.get("task_id", "?")[:8], data.get("status", "?"))
-                    f.unlink()  # consume
+                    f.unlink()
                 except Exception as e:
                     log.warning("Failed to read result file %s: %s", f, e)
         except Exception as e:
@@ -120,22 +134,32 @@ def result_listener_thread(result_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Pincer WS protocol
+# Pincer WS protocol (#5 fix: include conversation_id and depth)
 # ---------------------------------------------------------------------------
 
-def make_envelope(msg_type: str, from_id: str, to: str, payload: dict) -> str:
-    return json.dumps({
+def make_envelope(msg_type: str, from_id: str, to: str, payload: dict,
+                  conversation_id: str = "", depth: int = 0) -> str:
+    env = {
         "id": str(uuid.uuid4()),
         "type": msg_type,
         "from": from_id,
         "to": to,
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "payload": payload,
-    })
+    }
+    if conversation_id:
+        env["conversation_id"] = conversation_id
+    if depth > 0:
+        env["depth"] = depth
+    return json.dumps(env)
 
+
+# ---------------------------------------------------------------------------
+# Result send loop (#4: TASK_UPDATE for running status)
+# ---------------------------------------------------------------------------
 
 async def send_result_loop(ws, agent_id: str, dry_run: bool) -> None:
-    """Drain _result_queue and send TASK_RESULT to Pincer."""
+    """Drain _result_queue and send TASK_RESULT or TASK_UPDATE to Pincer."""
     while True:
         await asyncio.sleep(1)
         while not _result_queue.empty():
@@ -143,27 +167,37 @@ async def send_result_loop(ws, agent_id: str, dry_run: bool) -> None:
                 res = _result_queue.get_nowait()
             except queue.Empty:
                 break
+
             task_id = res.get("task_id", "")
             status = res.get("status", "done")
-            result_text = res.get("result", "")
-            error_text = res.get("error", "")
 
             if dry_run:
-                log.info("[DRY RUN] Would send TASK_RESULT: task=%s status=%s",
+                log.info("[DRY RUN] Would send %s: task=%s status=%s",
+                         "TASK_UPDATE" if status == "running" else "TASK_RESULT",
                          task_id[:8], status)
                 continue
 
-            payload = {"task_id": task_id, "status": status}
-            if status == "done":
-                payload["result"] = result_text
-            else:
-                payload["error"] = error_text
-
             try:
-                await ws.send(make_envelope("TASK_RESULT", agent_id, "hub", payload))
-                log.info("✅ TASK_RESULT sent: task=%s status=%s", task_id[:8], status)
+                if status == "running":
+                    # Interim progress update (#4)
+                    payload = {
+                        "task_id": task_id,
+                        "status": "running",
+                        "message": res.get("message", ""),
+                    }
+                    await ws.send(make_envelope("TASK_UPDATE", agent_id, "hub", payload))
+                    log.info("📊 TASK_UPDATE sent: task=%s", task_id[:8])
+                else:
+                    # Final result
+                    payload = {"task_id": task_id, "status": status}
+                    if status == "done":
+                        payload["result"] = res.get("result", "")
+                    else:
+                        payload["error"] = res.get("error", "")
+                    await ws.send(make_envelope("TASK_RESULT", agent_id, "hub", payload))
+                    log.info("✅ TASK_RESULT sent: task=%s status=%s", task_id[:8], status)
             except Exception as e:
-                log.warning("Failed to send TASK_RESULT: %s", e)
+                log.warning("Failed to send result: %s", e)
                 _result_queue.put(res)  # re-queue on failure
 
 
@@ -177,6 +211,10 @@ async def heartbeat_loop(ws, agent_id: str) -> None:
             log.warning("Heartbeat failed: %s", e)
             break
 
+
+# ---------------------------------------------------------------------------
+# Message handlers
+# ---------------------------------------------------------------------------
 
 async def handle_message(raw: str, cfg: dict, agent_id: str, ws, dry_run: bool) -> None:
     try:
@@ -213,19 +251,22 @@ async def handle_message(raw: str, cfg: dict, agent_id: str, ws, dry_run: bool) 
         context += (
             f"\nWhen done, write result to ~/.openclaw/pincer-results/<timestamp>.json:\n"
             f'  {{"task_id": "{task_id}", "status": "done", "result": "<summary>"}}\n'
-            f"The daemon will pick it up and send it back to Pincer automatically."
+            f"For progress updates use status 'running' with a 'message' field.\n"
+            f"The daemon will relay results back to Pincer automatically."
         )
         forward_to_agent(cfg, context, dry_run)
 
     elif msg_type in ("MESSAGE", "agent.message"):
+        # From field is set by hub from the sender's WS connection — no sender_agent_id in payload
         from_id = msg.get("from", "?")
         text = payload.get("text", "")
         log.info("💬 DM from %s: %s", from_id[:8], text[:80])
         forward_to_agent(cfg, f"[Pincer DM from {from_id}]\n{text}", dry_run)
 
-    elif msg_type in ("broadcast", "BROADCAST", "hub.broadcast"):
+    elif msg_type in ("broadcast", "BROADCAST"):
+        from_id = msg.get("from", "hub")
         text = payload.get("text", str(payload))
-        log.info("📢 Broadcast: %s", text[:80])
+        log.info("📢 Broadcast from %s: %s", from_id[:8], text[:80])
 
     elif msg_type == "inbox.delivery":
         items = payload if isinstance(payload, list) else [payload]
@@ -264,22 +305,18 @@ async def run_daemon(cfg: dict, dry_run: bool = False) -> None:
     pincer_url = cfg["pincer_url"]
     result_dir = Path.home() / ".openclaw" / "pincer-results"
 
-    # Start result listener in background thread
-    t = threading.Thread(
-        target=result_listener_thread, args=(result_dir,), daemon=True
-    )
+    t = threading.Thread(target=result_listener_thread, args=(result_dir,), daemon=True)
     t.start()
 
     reconnect_delay = RECONNECT_DELAY_BASE
     while True:
         try:
-            log.info("Connecting to %s ...", pincer_url)
-            # Append agent_id to URL (required by Pincer /ws endpoint)
             connect_url = pincer_url
             if "agent_id=" not in connect_url:
                 sep = "&" if "?" in connect_url else "?"
                 connect_url = f"{connect_url}{sep}agent_id={agent_id}"
-            log.debug("WS URL: %s", connect_url)
+            log.info("Connecting to %s ...", pincer_url)
+
             async with websockets.connect(connect_url, ping_interval=None, close_timeout=5) as ws:
                 reconnect_delay = RECONNECT_DELAY_BASE
 
@@ -320,8 +357,7 @@ async def run_daemon(cfg: dict, dry_run: bool = False) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Pincer WebSocket Daemon")
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH)
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Log events but don't forward to OpenClaw or Pincer")
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 

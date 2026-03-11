@@ -45,6 +45,9 @@ WantedBy=default.target
 EOF
 
 systemctl --user daemon-reload
+# Enable linger so the service survives SSH logout (required on EC2/Amazon Linux)
+loginctl enable-linger "$(whoami)" 2>/dev/null || true
+
 systemctl --user enable "$SERVICE_NAME"
 systemctl --user start "$SERVICE_NAME"
 
