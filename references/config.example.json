@@ -6,5 +6,6 @@
   "capabilities": ["coding", "go", "devops"],
   "session_key": "",
   "openclaw_bin": "openclaw",
-  "room_id": ""
+  "room_id": "",
+  "room_mention_only": true
 }

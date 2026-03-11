@@ -434,6 +434,14 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
                     # Don't forward messages sent by this agent (would loop)
                     if sender == agent_id:
                         continue
+                    # Mention filter: only forward if agent is explicitly mentioned
+                    # (unless room_mention_only is disabled in config)
+                    agent_name = cfg.get("agent_name", "")
+                    mention_only = cfg.get("room_mention_only", True)
+                    if mention_only and agent_name:
+                        if agent_name not in content and f"@{agent_name}" not in content:
+                            log.debug("💬 Room msg from %s ignored (no mention): %s", sender[:8], content[:40])
+                            continue
                     log.info("💬 Room msg from %s: %s", sender[:8], content[:60])
                     forward_to_agent(cfg, f"[Pincer Room msg from {sender}]\n{content}", dry_run)
         except websockets.exceptions.ConnectionClosed as e:
