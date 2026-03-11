@@ -216,7 +216,8 @@ async def heartbeat_loop(ws, agent_id: str) -> None:
 # Message handlers
 # ---------------------------------------------------------------------------
 
-async def handle_message(raw: str, cfg: dict, agent_id: str, ws, dry_run: bool) -> None:
+async def handle_message(raw: str, cfg: dict, agent_id: str, ws, dry_run: bool,
+                         _auth_done: list = None) -> None:
     try:
         msg = json.loads(raw)
     except json.JSONDecodeError:
@@ -231,7 +232,10 @@ async def handle_message(raw: str, cfg: dict, agent_id: str, ws, dry_run: bool) 
         if payload.get("status") != "ok":
             log.error("ACK error: %s", payload.get("error", "unknown"))
         else:
-            log.info("✓ Authenticated with Pincer hub.")
+            # Only log "Authenticated" once on initial AUTH handshake, not on every heartbeat ACK
+            if _auth_done is not None and not _auth_done:
+                _auth_done.append(True)
+                log.info("✓ Authenticated with Pincer hub.")
 
     elif msg_type in ("TASK_ASSIGN", "task.assigned"):
         task_id = payload.get("task_id", "?")
@@ -260,8 +264,14 @@ async def handle_message(raw: str, cfg: dict, agent_id: str, ws, dry_run: bool) 
         # From field is set by hub from the sender's WS connection — no sender_agent_id in payload
         from_id = msg.get("from", "?")
         text = payload.get("text", "")
+        pincer_url = cfg.get("pincer_url", "").replace("ws://", "http://").replace("wss://", "https://").rstrip("/ws")
         log.info("💬 DM from %s: %s", from_id[:8], text[:80])
-        forward_to_agent(cfg, f"[Pincer DM from {from_id}]\n{text}", dry_run)
+        reply_hint = (
+            f"\nTo reply via Pincer, POST to {pincer_url}/api/v1/messages/send:\n"
+            f'  {{"from_agent_id": "{agent_id}", "to_agent_id": "{from_id}", "payload": {{"text": "<reply>"}}}}\n'
+            f"  Header: X-API-Key: {cfg.get('api_key', '')}"
+        )
+        forward_to_agent(cfg, f"[Pincer DM from {from_id}]\n{text}{reply_hint}", dry_run)
 
     elif msg_type in ("broadcast", "BROADCAST"):
         from_id = msg.get("from", "hub")
@@ -333,9 +343,10 @@ async def run_daemon(cfg: dict, dry_run: bool = False) -> None:
 
                 hb_task = asyncio.create_task(heartbeat_loop(ws, agent_id))
                 result_task = asyncio.create_task(send_result_loop(ws, agent_id, dry_run))
+                auth_done = []  # mutable flag: empty = not yet authed, [True] = authed
                 try:
                     async for raw in ws:
-                        await handle_message(raw, cfg, agent_id, ws, dry_run)
+                        await handle_message(raw, cfg, agent_id, ws, dry_run, auth_done)
                 finally:
                     hb_task.cancel()
                     result_task.cancel()
