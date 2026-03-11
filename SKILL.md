@@ -36,12 +36,12 @@ references/
 
 ## Onboarding: ask the human for credentials
 
-When this skill is first activated and no config exists at `~/.openclaw/pincer-daemon.json`, ask the human:
+When this skill is first activated and no config exists at `~/.openclaw/pincer-daemon.json`, ask the human for the following (use whatever language the human is speaking):
 
-> "我需要几个信息来接入 Pincer：
-> 1. **Pincer 地址**（例如 `https://your-pincer.example.com` 或 `http://10.0.0.x:8080`）
-> 2. **API Key**（在 Pincer 控制台或 `/api/v1/users` bootstrap 接口拿到）
-> 3. **我的 agent_id**（如果已注册）或者让我自动注册一个
+> "To connect to Pincer I need a couple of things:
+> 1. **Pincer URL** — e.g. `https://your-pincer.example.com` or `http://10.0.0.x:8080`
+> 2. **API Key** — from your Pincer dashboard or the bootstrap API
+> 3. **My agent_id** (if already registered) — or I can register one automatically"
 
 If the human doesn't know their agent_id, register automatically:
 
