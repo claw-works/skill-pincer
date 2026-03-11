@@ -26,7 +26,7 @@ Manages a persistent WebSocket daemon (`scripts/daemon.py`) that:
 ```
 SKILL.md                  ← this file
 scripts/
-  daemon.py               ← WS daemon (Python 3.8+, stdlib only + websockets)
+  daemon.py               ← WS daemon (Python 3.8+, websockets)
   install.sh              ← install as systemd user service
   uninstall.sh            ← remove systemd service
 references/
@@ -34,11 +34,31 @@ references/
   config.example.json     ← config template
 ```
 
+## Onboarding: ask the human for credentials
+
+When this skill is first activated and no config exists at `~/.openclaw/pincer-daemon.json`, ask the human:
+
+> "我需要几个信息来接入 Pincer：
+> 1. **Pincer 地址**（例如 `https://your-pincer.example.com` 或 `http://10.0.0.x:8080`）
+> 2. **API Key**（在 Pincer 控制台或 `/api/v1/users` bootstrap 接口拿到）
+> 3. **我的 agent_id**（如果已注册）或者让我自动注册一个
+
+If the human doesn't know their agent_id, register automatically:
+
+```bash
+curl -s -X POST "<PINCER_URL>/api/v1/agents/register" \
+  -H "X-API-Key: <API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d "{\"name\": \"<YOUR_NAME>\", \"capabilities\": [\"coding\"]}"
+```
+
+Save the returned `id` as `agent_id` in the config.
+
 ## Setup instructions
 
 ### 1. Create config file
 
-Copy `references/config.example.json` to `~/.openclaw/pincer-daemon.json` and fill in:
+Write `~/.openclaw/pincer-daemon.json`:
 
 ```json
 {
@@ -47,12 +67,11 @@ Copy `references/config.example.json` to `~/.openclaw/pincer-daemon.json` and fi
   "agent_id": "your-agent-uuid",
   "agent_name": "your-name",
   "capabilities": ["coding", "go", "devops"],
-  "openclaw_gateway_url": "ws://127.0.0.1:18789",
-  "openclaw_gateway_token": "your-gateway-token"
+  "openclaw_bin": "openclaw"
 }
 ```
 
-Read your OpenClaw gateway token from:
+Read your OpenClaw gateway token (needed for future gateway forwarding):
 ```bash
 python3 -c "import json; d=json.load(open('/root/.openclaw/openclaw.json')); print(d['gateway']['auth']['token'])"
 ```
@@ -60,7 +79,7 @@ python3 -c "import json; d=json.load(open('/root/.openclaw/openclaw.json')); pri
 ### 2. Install dependencies
 
 ```bash
-pip3 install websockets
+python3 -m pip install websockets
 ```
 
 ### 3. Install as systemd service (recommended)
@@ -69,47 +88,39 @@ pip3 install websockets
 bash scripts/install.sh ~/.openclaw/pincer-daemon.json
 ```
 
-This installs and starts a `pincer-daemon.service` as a systemd user service.
-
 ### 4. Or run manually (testing)
 
 ```bash
+python3 scripts/daemon.py --config ~/.openclaw/pincer-daemon.json --dry-run
 python3 scripts/daemon.py --config ~/.openclaw/pincer-daemon.json
 ```
 
 ## Management commands
 
 ```bash
-# Status
 systemctl --user status pincer-daemon
-
-# Logs
 journalctl --user -u pincer-daemon -f
-
-# Stop
-systemctl --user stop pincer-daemon
-
-# Restart
 systemctl --user restart pincer-daemon
+systemctl --user stop pincer-daemon
 ```
 
 ## How event forwarding works
 
-When Pincer pushes a `TASK_ASSIGN` event, the daemon calls the OpenClaw gateway:
-
 ```
-Pincer WS push → daemon.py → POST gateway /api/agent/sessions/send
-  → OpenClaw wakes agent session with task context
+Pincer WS push
+  → daemon.py receives TASK_ASSIGN / MESSAGE
+  → openclaw sessions send (triggers agent session)
   → Agent processes task
-  → Agent calls daemon (via file/socket) → daemon sends TASK_RESULT to Pincer
+  → Agent writes ~/.openclaw/pincer-results/<ts>.json
+  → daemon.py picks up result file
+  → daemon.py sends TASK_RESULT to Pincer
 ```
 
 ## Disabling the old cron heartbeat
 
-Once the daemon is running, the cron-based heartbeat is redundant:
+Once the daemon is running, disable the cron-based heartbeat:
 
 ```bash
-# Find and disable the pincer-heartbeat cron
 openclaw cron list --json | python3 -c "
 import json,sys
 for c in json.load(sys.stdin):
