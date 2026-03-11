@@ -274,7 +274,13 @@ async def run_daemon(cfg: dict, dry_run: bool = False) -> None:
     while True:
         try:
             log.info("Connecting to %s ...", pincer_url)
-            async with websockets.connect(pincer_url, ping_interval=None, close_timeout=5) as ws:
+            # Append agent_id to URL (required by Pincer /ws endpoint)
+            connect_url = pincer_url
+            if "agent_id=" not in connect_url:
+                sep = "&" if "?" in connect_url else "?"
+                connect_url = f"{connect_url}{sep}agent_id={agent_id}"
+            log.debug("WS URL: %s", connect_url)
+            async with websockets.connect(connect_url, ping_interval=None, close_timeout=5) as ws:
                 reconnect_delay = RECONNECT_DELAY_BASE
 
                 await ws.send(make_envelope("REGISTER", agent_id, "hub", {
