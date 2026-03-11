@@ -77,11 +77,33 @@ def forward_to_agent(cfg: dict, message: str, dry_run: bool = False) -> None:
     bin_ = cfg["openclaw_bin"]
     session_key = cfg.get("session_key", "").strip()
 
-    # Build command — use `openclaw agent -m` to trigger an agent turn
-    # Omit --to if no session_key so openclaw routes to the default main session
-    if session_key:
-        cmd = [bin_, "agent", "--to", session_key, "-m", message]
-    else:
+    # Build command — use `openclaw agent --session-id <id> -m <text>`
+    # If session_key is configured, look up its sessionId dynamically.
+    # If not configured, use the most recently active direct session.
+    try:
+        result = subprocess.run(
+            [bin_, "sessions", "--json"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            import json as _json
+            data = _json.loads(result.stdout)
+            sessions = data.get("sessions", [])
+            if session_key:
+                match = [s for s in sessions if session_key in s.get("key", "")]
+            else:
+                match = [s for s in sessions if s.get("kind") == "direct"]
+            if match:
+                session_id = match[0]["sessionId"]
+                cmd = [bin_, "agent", "--session-id", session_id, "-m", message]
+            else:
+                log.warning("No matching session found, trying without session-id")
+                cmd = [bin_, "agent", "-m", message]
+        else:
+            log.warning("Could not list sessions: %s", result.stderr[:100])
+            cmd = [bin_, "agent", "-m", message]
+    except Exception as e:
+        log.warning("Session lookup failed: %s", e)
         cmd = [bin_, "agent", "-m", message]
 
     try:
