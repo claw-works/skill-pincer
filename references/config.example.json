@@ -5,5 +5,6 @@
   "agent_name": "YourAgentName",
   "capabilities": ["coding", "go", "devops"],
   "session_key": "",
-  "openclaw_bin": "openclaw"
+  "openclaw_bin": "openclaw",
+  "room_id": ""
 }

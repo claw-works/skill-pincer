@@ -344,6 +344,9 @@ async def run_daemon(cfg: dict, dry_run: bool = False) -> None:
     t = threading.Thread(target=result_listener_thread, args=(result_dir,), daemon=True)
     t.start()
 
+    # Run room WS loop concurrently (if room_id configured)
+    room_task = asyncio.create_task(run_room_loop(cfg, dry_run))
+
     reconnect_delay = RECONNECT_DELAY_BASE
     while True:
         try:
@@ -389,6 +392,66 @@ async def run_daemon(cfg: dict, dry_run: bool = False) -> None:
 
         await asyncio.sleep(reconnect_delay)
         reconnect_delay = min(reconnect_delay * 2, RECONNECT_DELAY_MAX)
+
+    room_task.cancel()
+    try:
+        await room_task
+    except asyncio.CancelledError:
+        pass
+
+
+async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
+    """Subscribe to the Pincer room WebSocket and forward messages to agent session."""
+    room_id = cfg.get("room_id", "").strip()
+    if not room_id:
+        return  # no room configured, skip
+
+    agent_id = cfg["agent_id"]
+    api_key = cfg["api_key"]
+
+    # Convert WS URL back to HTTP base
+    base_url = cfg["pincer_url"].rstrip("/ws").replace("wss://", "https://").replace("ws://", "http://")
+    room_ws_url = f"{base_url.replace('http://', 'ws://').replace('https://', 'wss://')}/api/v1/rooms/{room_id}/ws?api_key={api_key}"
+
+    reconnect_delay = RECONNECT_DELAY_BASE
+    log.info("Room WS: subscribing to room %s", room_id)
+    while True:
+        try:
+            async with websockets.connect(room_ws_url, ping_interval=None, close_timeout=5) as ws:
+                reconnect_delay = RECONNECT_DELAY_BASE
+                log.info("Room WS: connected to room %s", room_id)
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    msg_type = msg.get("type", "")
+                    if msg_type != "room.message":
+                        continue
+                    data = msg.get("data") or msg.get("payload") or {}
+                    sender = data.get("sender_agent_id", "unknown")
+                    content = data.get("content", "")
+                    # Don't forward messages sent by this agent (would loop)
+                    if sender == agent_id:
+                        continue
+                    log.info("💬 Room msg from %s: %s", sender[:8], content[:60])
+                    forward_to_agent(cfg, f"[Pincer Room msg from {sender}]\n{content}", dry_run)
+        except websockets.exceptions.ConnectionClosed as e:
+            log.warning("Room WS disconnected: %s. Retry in %ds...", e, reconnect_delay)
+        except OSError as e:
+            log.warning("Room WS error: %s. Retry in %ds...", e, reconnect_delay)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.warning("Room WS unexpected: %s. Retry in %ds...", e, reconnect_delay)
+        await asyncio.sleep(reconnect_delay)
+        reconnect_delay = min(reconnect_delay * 2, RECONNECT_DELAY_MAX)
+
+    room_task.cancel()
+    try:
+        await room_task
+    except asyncio.CancelledError:
+        pass
 
 
 def main() -> None:
