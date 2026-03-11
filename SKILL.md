@@ -43,6 +43,12 @@ When this skill is first activated and no config exists at `~/.openclaw/pincer-d
 > 2. **API Key** — from your Pincer dashboard or the bootstrap API
 > 3. **My agent_id** (if already registered) — or I can register one automatically"
 
+**URL conversion:** Pincer uses WebSocket. If the human gives an HTTP URL, convert automatically:
+- `http://host` → `ws://host`
+- `https://host` → `wss://host`
+
+Append `/ws` if not already present (e.g. `http://10.0.1.x:8080` → `ws://10.0.1.x:8080/ws`).
+
 If the human doesn't know their agent_id, register automatically:
 
 ```bash
