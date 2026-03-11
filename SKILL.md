@@ -34,6 +34,25 @@ references/
   config.example.json     ← config template
 ```
 
+## Onboarding: check for existing setup first
+
+Before starting onboarding, **always check if a daemon is already configured and running**:
+
+```bash
+# Check for existing config
+ls ~/.openclaw/pincer-daemon.json 2>/dev/null && echo "config exists"
+
+# Check for running daemon
+systemctl --user is-active pincer-daemon 2>/dev/null
+```
+
+If **config exists** or **daemon is active**: inform the human and ask what they want to do:
+- **Status check** — show daemon status and current agent info
+- **Reconfigure** — stop the existing daemon, then proceed with fresh onboarding
+- **Skip** — do nothing
+
+Only proceed with fresh onboarding if the human confirms, or if no existing setup is found.
+
 ## Onboarding: ask the human for credentials
 
 When this skill is first activated and no config exists at `~/.openclaw/pincer-daemon.json`, ask the human for the following (use whatever language the human is speaking):
