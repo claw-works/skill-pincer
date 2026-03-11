@@ -400,6 +400,22 @@ async def run_daemon(cfg: dict, dry_run: bool = False) -> None:
         pass
 
 
+async def fetch_human_agent_ids(base_url: str, api_key: str) -> set:
+    """Fetch agents list and return set of human agent IDs."""
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"{base_url}/api/v1/agents",
+            headers={"X-API-Key": api_key},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            agents = json.loads(resp.read())
+            return {a["id"] for a in agents if a.get("type") == "human"}
+    except Exception as e:
+        log.warning("Failed to fetch human agents: %s", e)
+        return set()
+
+
 async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
     """Subscribe to the Pincer room WebSocket and forward messages to agent session."""
     room_id = cfg.get("room_id", "").strip()
@@ -412,6 +428,11 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
     # Convert WS URL back to HTTP base
     base_url = cfg["pincer_url"].rstrip("/ws").replace("wss://", "https://").replace("ws://", "http://")
     room_ws_url = f"{base_url.replace('http://', 'ws://').replace('https://', 'wss://')}/api/v1/rooms/{room_id}/ws?api_key={api_key}"
+
+    # Cache human agent IDs (refresh every ~5 min)
+    human_agent_ids: set = await fetch_human_agent_ids(base_url, api_key)
+    human_ids_refreshed_at = time.time()
+    HUMAN_IDS_TTL = 300  # seconds
 
     reconnect_delay = RECONNECT_DELAY_BASE
     log.info("Room WS: subscribing to room %s", room_id)
@@ -434,14 +455,21 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
                     # Don't forward messages sent by this agent (would loop)
                     if sender == agent_id:
                         continue
-                    # Mention filter: only forward if agent is explicitly mentioned
-                    # (unless room_mention_only is disabled in config)
+                    # Periodically refresh human agent IDs cache
+                    if time.time() - human_ids_refreshed_at > HUMAN_IDS_TTL:
+                        human_agent_ids = await fetch_human_agent_ids(base_url, api_key)
+                        human_ids_refreshed_at = time.time()
+                    # Forward rules:
+                    # 1. sender is human → always forward
+                    # 2. message mentions agent name → forward
+                    # 3. otherwise (mention_only mode) → discard
                     agent_name = cfg.get("agent_name", "")
                     mention_only = cfg.get("room_mention_only", True)
-                    if mention_only and agent_name:
-                        if agent_name not in content and f"@{agent_name}" not in content:
-                            log.debug("💬 Room msg from %s ignored (no mention): %s", sender[:8], content[:40])
-                            continue
+                    is_human_sender = sender in human_agent_ids
+                    is_mentioned = agent_name and (agent_name in content or f"@{agent_name}" in content)
+                    if not is_human_sender and mention_only and not is_mentioned:
+                        log.debug("💬 Room msg from %s ignored (no mention, not human): %s", sender[:8], content[:40])
+                        continue
                     log.info("💬 Room msg from %s: %s", sender[:8], content[:60])
                     forward_to_agent(cfg, f"[Pincer Room msg from {sender}]\n{content}", dry_run)
         except websockets.exceptions.ConnectionClosed as e:
