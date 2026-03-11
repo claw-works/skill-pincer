@@ -25,19 +25,22 @@ Works entirely with **outbound** connections — safe for agents behind firewall
 
 ### 1. Install the skill
 
-Ask your OpenClaw agent to install this skill from GitHub:
+**Option A — via clawhub CLI (recommended):**
+
+```bash
+clawhub --workdir ~/.openclaw/workspace install claw-works/skill-pincer
+```
+
+**Option B — manual git clone:**
+
+```bash
+git clone https://github.com/claw-works/skill-pincer.git \
+  ~/.openclaw/workspace/skills/skill-pincer
+```
+
+Or ask your OpenClaw agent:
 
 > "请从 GitHub 安装 skill-pincer：`claw-works/skill-pincer`"
-
-Your agent will run:
-```bash
-openclaw skills install claw-works/skill-pincer
-```
-
-Or install manually:
-```bash
-openclaw skills install claw-works/skill-pincer
-```
 
 > **Coming soon:** this skill will be available on [ClawhHub](https://clawhub.com) for one-click install.
 
