@@ -107,15 +107,18 @@ def forward_to_agent(cfg: dict, message: str, dry_run: bool = False) -> None:
         cmd = [bin_, "agent", "-m", message]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode != 0:
-            log.warning("sessions send failed (rc=%d): %s", result.returncode, result.stderr[:200])
-        else:
-            log.info("Forwarded to OpenClaw agent")
+        # Run in background (fire-and-forget) — agent turns can take 30-120s,
+        # blocking here would freeze the WS event loop
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        log.info("Forwarded to OpenClaw agent (background)")
     except FileNotFoundError:
         log.error("openclaw binary not found at: %s", bin_)
-    except subprocess.TimeoutExpired:
-        log.warning("sessions send timed out")
+    except Exception as e:
+        log.warning("sessions send failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
