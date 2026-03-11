@@ -77,11 +77,12 @@ def forward_to_agent(cfg: dict, message: str, dry_run: bool = False) -> None:
     bin_ = cfg["openclaw_bin"]
     session_key = cfg.get("session_key", "").strip()
 
-    # Build command — omit --session-key if not configured so openclaw
-    # routes to the default main session (#2)
-    cmd = [bin_, "sessions", "send", "--message", message]
+    # Build command — use `openclaw agent -m` to trigger an agent turn
+    # Omit --to if no session_key so openclaw routes to the default main session
     if session_key:
-        cmd = [bin_, "sessions", "send", "--session-key", session_key, "--message", message]
+        cmd = [bin_, "agent", "--to", session_key, "-m", message]
+    else:
+        cmd = [bin_, "agent", "-m", message]
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
