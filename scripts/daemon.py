@@ -408,10 +408,14 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
 
     agent_id = cfg["agent_id"]
     api_key = cfg["api_key"]
+    context_window = cfg.get("room_context_window", 5)  # how many recent msgs to include as context
 
     # Convert WS URL back to HTTP base
     base_url = cfg["pincer_url"].rstrip("/ws").replace("wss://", "https://").replace("ws://", "http://")
     room_ws_url = f"{base_url.replace('http://', 'ws://').replace('https://', 'wss://')}/api/v1/rooms/{room_id}/ws?api_key={api_key}"
+
+    # Rolling context buffer: keeps last N room messages for context
+    context_buf: collections.deque = collections.deque(maxlen=max(context_window, 1))
 
     reconnect_delay = RECONNECT_DELAY_BASE
     log.info("Room WS: subscribing to room %s", room_id)
@@ -433,9 +437,12 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
                     content = data.get("content", "")
                     # Don't forward messages sent by this agent (would loop)
                     if sender == agent_id:
+                        context_buf.append(f"[{sender[:8]}(me)]: {content}")
                         continue
+                    # Add to context buffer before filtering
+                    context_buf.append(f"[{sender[:8]}]: {content}")
                     # Forward rules (mention_only mode, default true):
-                    # 1. @agent名字 or @agent_id prefix → forward to this agent
+                    # 1. @agent名字 → forward to this agent
                     # 2. @all or @所有人 → broadcast, forward to all agents
                     # 3. otherwise → discard (0 token cost)
                     agent_name = cfg.get("agent_name", "")
@@ -446,7 +453,14 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
                         log.debug("💬 Room msg from %s ignored (no mention): %s", sender[:8], content[:40])
                         continue
                     log.info("💬 Room msg from %s: %s", sender[:8], content[:60])
-                    forward_to_agent(cfg, f"[Pincer Room msg from {sender}]\n{content}", dry_run)
+                    # Build context string from recent messages (excluding the current one)
+                    ctx_msgs = list(context_buf)[:-1]  # all except the triggering message
+                    if ctx_msgs and context_window > 0:
+                        ctx_str = "\n".join(ctx_msgs)
+                        forward_text = f"[Pincer Room context (last {len(ctx_msgs)} msgs)]\n{ctx_str}\n\n[Pincer Room msg from {sender}]\n{content}"
+                    else:
+                        forward_text = f"[Pincer Room msg from {sender}]\n{content}"
+                    forward_to_agent(cfg, forward_text, dry_run)
         except websockets.exceptions.ConnectionClosed as e:
             log.warning("Room WS disconnected: %s. Retry in %ds...", e, reconnect_delay)
         except OSError as e:

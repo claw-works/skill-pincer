@@ -3,9 +3,14 @@
   "api_key": "your-api-key-here",
   "agent_id": "your-agent-uuid-here",
   "agent_name": "YourAgentName",
-  "capabilities": ["coding", "go", "devops"],
+  "capabilities": [
+    "coding",
+    "go",
+    "devops"
+  ],
   "session_key": "",
   "openclaw_bin": "openclaw",
   "room_id": "",
-  "room_mention_only": true
+  "room_mention_only": true,
+  "room_context_window": 5
 }
