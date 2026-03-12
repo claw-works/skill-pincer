@@ -402,8 +402,29 @@ async def run_daemon(cfg: dict, dry_run: bool = False) -> None:
 async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
     """Subscribe to the Pincer room WebSocket and forward messages to agent session."""
     room_id = cfg.get("room_id", "").strip()
+
+    # Auto-discover room_id if not configured
     if not room_id:
-        return  # no room configured, skip
+        base_url = cfg["pincer_url"].removesuffix("/ws").replace("wss://", "https://").replace("ws://", "http://")
+        api_key = cfg["api_key"]
+        try:
+            loop = asyncio.get_event_loop()
+            import urllib.request as _urllib
+            def _fetch_rooms():
+                req = _urllib.Request(f"{base_url}/api/v1/rooms",
+                    headers={"X-API-Key": api_key})
+                with _urllib.urlopen(req, timeout=5) as r:
+                    return json.loads(r.read())
+            rooms = await loop.run_in_executor(None, _fetch_rooms)
+            if rooms:
+                room_id = rooms[0]["id"]
+                log.info("Room auto-discovered: %s", room_id)
+            else:
+                log.info("No rooms found, room subscription disabled")
+                return
+        except Exception as e:
+            log.warning("Room auto-discover failed: %s — room subscription disabled", e)
+            return
 
     agent_id = cfg["agent_id"]
     api_key = cfg["api_key"]
