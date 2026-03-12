@@ -20,6 +20,7 @@ import signal
 import sys
 import threading
 import time
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -339,6 +340,25 @@ async def run_daemon(cfg: dict, dry_run: bool = False) -> None:
     agent_id = cfg["agent_id"]
     pincer_url = cfg["pincer_url"]
     result_dir = Path.home() / ".openclaw" / "pincer-results"
+
+    # Auto-discover room_id if not configured: GET /api/v1/rooms → first result
+    if not cfg.get("room_id", "").strip():
+        _raw = pincer_url.replace("wss://", "https://").replace("ws://", "http://")
+        _base = _raw[:-3] if _raw.endswith("/ws") else _raw
+        try:
+            req = urllib.request.Request(
+                f"{_base}/api/v1/rooms",
+                headers={"X-API-Key": cfg["api_key"]},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                rooms = json.loads(resp.read())
+            if rooms:
+                cfg["room_id"] = rooms[0]["id"]
+                log.info("Auto-discovered room_id: %s", cfg["room_id"])
+            else:
+                log.warning("No rooms found for this API key, room subscription skipped.")
+        except Exception as e:
+            log.warning("Could not auto-discover room_id: %s", e)
 
     t = threading.Thread(target=result_listener_thread, args=(result_dir,), daemon=True)
     t.start()

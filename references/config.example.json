@@ -10,7 +10,6 @@
   ],
   "session_key": "",
   "openclaw_bin": "openclaw",
-  "room_id": "",
   "room_mention_only": true,
   "room_context_window": 5
 }
