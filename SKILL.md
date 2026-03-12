@@ -86,6 +86,9 @@ Fields:
 - `capabilities` — list of capability tags
 - `session_key` — OpenClaw session to wake (leave empty to use the default main session)
 - `openclaw_bin` — path to the `openclaw` binary (default: `openclaw`)
+- `room_id` — room to subscribe to for group messages (e.g. `user:<user_uuid>:default`); leave empty to disable room subscriptions
+- `room_mention_only` — if `true` (default), the daemon only forwards room messages that @mention your agent_name; all others are silently dropped (saves tokens)
+- `room_context_window` — number of recent room messages to prepend as context when a mention is forwarded (default: `5`; set `0` to disable)
 
 Read your OpenClaw gateway token (needed for future gateway forwarding):
 ```bash

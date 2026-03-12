@@ -77,22 +77,48 @@ def forward_to_agent(cfg: dict, message: str, dry_run: bool = False) -> None:
     bin_ = cfg["openclaw_bin"]
     session_key = cfg.get("session_key", "").strip()
 
-    # Build command — omit --session-key if not configured so openclaw
-    # routes to the default main session (#2)
-    cmd = [bin_, "sessions", "send", "--message", message]
-    if session_key:
-        cmd = [bin_, "sessions", "send", "--session-key", session_key, "--message", message]
+    # Build command — use `openclaw agent --session-id <id> -m <text>`
+    # If session_key is configured, look up its sessionId dynamically.
+    # If not configured, use the most recently active direct session.
+    try:
+        result = subprocess.run(
+            [bin_, "sessions", "--json"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            import json as _json
+            data = _json.loads(result.stdout)
+            sessions = data.get("sessions", [])
+            if session_key:
+                match = [s for s in sessions if session_key in s.get("key", "")]
+            else:
+                match = [s for s in sessions if s.get("kind") == "direct"]
+            if match:
+                session_id = match[0]["sessionId"]
+                cmd = [bin_, "agent", "--session-id", session_id, "-m", message]
+            else:
+                log.warning("No matching session found, trying without session-id")
+                cmd = [bin_, "agent", "-m", message]
+        else:
+            log.warning("Could not list sessions: %s", result.stderr[:100])
+            cmd = [bin_, "agent", "-m", message]
+    except Exception as e:
+        log.warning("Session lookup failed: %s", e)
+        cmd = [bin_, "agent", "-m", message]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode != 0:
-            log.warning("sessions send failed (rc=%d): %s", result.returncode, result.stderr[:200])
-        else:
-            log.info("Forwarded to OpenClaw agent")
+        # Run in background (fire-and-forget) — agent turns can take 30-120s,
+        # blocking here would freeze the WS event loop
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        log.info("Forwarded to OpenClaw agent (background)")
     except FileNotFoundError:
         log.error("openclaw binary not found at: %s", bin_)
-    except subprocess.TimeoutExpired:
-        log.warning("sessions send timed out")
+    except Exception as e:
+        log.warning("sessions send failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +290,7 @@ async def handle_message(raw: str, cfg: dict, agent_id: str, ws, dry_run: bool,
         # From field is set by hub from the sender's WS connection — no sender_agent_id in payload
         from_id = msg.get("from", "?")
         text = payload.get("text", "")
-        pincer_url = cfg.get("pincer_url", "").replace("ws://", "http://").replace("wss://", "https://").rstrip("/ws")
+        pincer_url = cfg.get("pincer_url", "").replace("ws://", "http://").replace("wss://", "https://").removesuffix("/ws")
         log.info("💬 DM from %s: %s", from_id[:8], text[:80])
         reply_hint = (
             f"\nTo reply via Pincer, POST to {pincer_url}/api/v1/messages/send:\n"
@@ -318,6 +344,9 @@ async def run_daemon(cfg: dict, dry_run: bool = False) -> None:
     t = threading.Thread(target=result_listener_thread, args=(result_dir,), daemon=True)
     t.start()
 
+    # Run room WS loop concurrently (if room_id configured)
+    room_task = asyncio.create_task(run_room_loop(cfg, dry_run))
+
     reconnect_delay = RECONNECT_DELAY_BASE
     while True:
         try:
@@ -361,6 +390,85 @@ async def run_daemon(cfg: dict, dry_run: bool = False) -> None:
         except Exception as e:
             log.exception("Unexpected: %s. Retry in %ds...", e, reconnect_delay)
 
+        await asyncio.sleep(reconnect_delay)
+        reconnect_delay = min(reconnect_delay * 2, RECONNECT_DELAY_MAX)
+
+    room_task.cancel()
+    try:
+        await room_task
+    except asyncio.CancelledError:
+        pass
+
+
+async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
+    """Subscribe to the Pincer room WebSocket and forward messages to agent session."""
+    room_id = cfg.get("room_id", "").strip()
+    if not room_id:
+        return  # no room configured, skip
+
+    agent_id = cfg["agent_id"]
+    api_key = cfg["api_key"]
+    context_window = cfg.get("room_context_window", 5)  # how many recent msgs to include as context
+
+    # Convert WS URL back to HTTP base
+    base_url = cfg["pincer_url"].removesuffix("/ws").replace("wss://", "https://").replace("ws://", "http://")
+    room_ws_url = f"{base_url.replace('http://', 'ws://').replace('https://', 'wss://')}/api/v1/rooms/{room_id}/ws?api_key={api_key}"
+
+    # Rolling context buffer: keeps last N room messages for context
+    context_buf: collections.deque = collections.deque(maxlen=max(context_window, 1))
+
+    reconnect_delay = RECONNECT_DELAY_BASE
+    log.info("Room WS: subscribing to room %s", room_id)
+    while True:
+        try:
+            async with websockets.connect(room_ws_url, ping_interval=None, close_timeout=5) as ws:
+                reconnect_delay = RECONNECT_DELAY_BASE
+                log.info("Room WS: connected to room %s", room_id)
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    msg_type = msg.get("type", "")
+                    if msg_type != "room.message":
+                        continue
+                    data = msg.get("data") or msg.get("payload") or {}
+                    sender = data.get("sender_agent_id", "unknown")
+                    content = data.get("content", "")
+                    # Don't forward messages sent by this agent (would loop)
+                    if sender == agent_id:
+                        context_buf.append(f"[{sender[:8]}(me)]: {content}")
+                        continue
+                    # Add to context buffer before filtering
+                    context_buf.append(f"[{sender[:8]}]: {content}")
+                    # Forward rules (mention_only mode, default true):
+                    # 1. @agent名字 → forward to this agent
+                    # 2. @all or @所有人 → broadcast, forward to all agents
+                    # 3. otherwise → discard (0 token cost)
+                    agent_name = cfg.get("agent_name", "")
+                    mention_only = cfg.get("room_mention_only", True)
+                    is_mentioned = agent_name and (agent_name in content or f"@{agent_name}" in content)
+                    is_broadcast = "@all" in content or "@所有人" in content
+                    if mention_only and not is_mentioned and not is_broadcast:
+                        log.debug("💬 Room msg from %s ignored (no mention): %s", sender[:8], content[:40])
+                        continue
+                    log.info("💬 Room msg from %s: %s", sender[:8], content[:60])
+                    # Build context string from recent messages (excluding the current one)
+                    ctx_msgs = list(context_buf)[:-1]  # all except the triggering message
+                    if ctx_msgs and context_window > 0:
+                        ctx_str = "\n".join(ctx_msgs)
+                        forward_text = f"[Pincer Room context (last {len(ctx_msgs)} msgs)]\n{ctx_str}\n\n[Pincer Room msg from {sender}]\n{content}"
+                    else:
+                        forward_text = f"[Pincer Room msg from {sender}]\n{content}"
+                    forward_to_agent(cfg, forward_text, dry_run)
+        except websockets.exceptions.ConnectionClosed as e:
+            log.warning("Room WS disconnected: %s. Retry in %ds...", e, reconnect_delay)
+        except OSError as e:
+            log.warning("Room WS error: %s. Retry in %ds...", e, reconnect_delay)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.warning("Room WS unexpected: %s. Retry in %ds...", e, reconnect_delay)
         await asyncio.sleep(reconnect_delay)
         reconnect_delay = min(reconnect_delay * 2, RECONNECT_DELAY_MAX)
 
