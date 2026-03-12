@@ -17,7 +17,6 @@ import logging
 import os
 import queue
 import signal
-import subprocess
 import sys
 import threading
 import time
@@ -68,7 +67,7 @@ def load_config(path: str) -> dict:
 # OpenClaw forwarding — invoke agent via CLI (#2 fix: session_key optional)
 # ---------------------------------------------------------------------------
 
-def forward_to_agent(cfg: dict, message: str, dry_run: bool = False) -> None:
+async def forward_to_agent(cfg: dict, message: str, dry_run: bool = False) -> None:
     """Trigger an OpenClaw agent session turn with `message` as input."""
     if dry_run:
         log.info("[DRY RUN] Would forward to OpenClaw:\n  %s", message[:200])
@@ -78,16 +77,18 @@ def forward_to_agent(cfg: dict, message: str, dry_run: bool = False) -> None:
     session_key = cfg.get("session_key", "").strip()
 
     # Build command — use `openclaw agent --session-id <id> -m <text>`
-    # If session_key is configured, look up its sessionId dynamically.
-    # If not configured, use the most recently active direct session.
+    # Session lookup is async to avoid blocking the WS event loop.
+    cmd = [bin_, "agent", "-m", message]
     try:
-        result = subprocess.run(
-            [bin_, "sessions", "--json"],
-            capture_output=True, text=True, timeout=10
+        proc = await asyncio.create_subprocess_exec(
+            bin_, "sessions", "--json",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
         )
-        if result.returncode == 0:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        if proc.returncode == 0:
             import json as _json
-            data = _json.loads(result.stdout)
+            data = _json.loads(stdout)
             sessions = data.get("sessions", [])
             if session_key:
                 match = [s for s in sessions if session_key in s.get("key", "")]
@@ -98,21 +99,19 @@ def forward_to_agent(cfg: dict, message: str, dry_run: bool = False) -> None:
                 cmd = [bin_, "agent", "--session-id", session_id, "-m", message]
             else:
                 log.warning("No matching session found, trying without session-id")
-                cmd = [bin_, "agent", "-m", message]
         else:
-            log.warning("Could not list sessions: %s", result.stderr[:100])
-            cmd = [bin_, "agent", "-m", message]
+            log.warning("Could not list sessions (rc=%d)", proc.returncode)
+    except asyncio.TimeoutError:
+        log.warning("Session lookup timed out, using default agent command")
     except Exception as e:
         log.warning("Session lookup failed: %s", e)
-        cmd = [bin_, "agent", "-m", message]
 
     try:
-        # Run in background (fire-and-forget) — agent turns can take 30-120s,
-        # blocking here would freeze the WS event loop
-        subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        # Fire-and-forget — agent turns can take 30-120s; don't await
+        await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
         log.info("Forwarded to OpenClaw agent (background)")
     except FileNotFoundError:
@@ -284,7 +283,7 @@ async def handle_message(raw: str, cfg: dict, agent_id: str, ws, dry_run: bool,
             f"For progress updates use status 'running' with a 'message' field.\n"
             f"The daemon will relay results back to Pincer automatically."
         )
-        forward_to_agent(cfg, context, dry_run)
+        await forward_to_agent(cfg, context, dry_run)
 
     elif msg_type in ("MESSAGE", "agent.message"):
         # From field is set by hub from the sender's WS connection — no sender_agent_id in payload
@@ -297,7 +296,7 @@ async def handle_message(raw: str, cfg: dict, agent_id: str, ws, dry_run: bool,
             f'  {{"from_agent_id": "{agent_id}", "to_agent_id": "{from_id}", "payload": {{"text": "<reply>"}}}}\n'
             f"  Header: X-API-Key: {cfg.get('api_key', '')}"
         )
-        forward_to_agent(cfg, f"[Pincer DM from {from_id}]\n{text}{reply_hint}", dry_run)
+        await forward_to_agent(cfg, f"[Pincer DM from {from_id}]\n{text}{reply_hint}", dry_run)
 
     elif msg_type in ("broadcast", "BROADCAST"):
         from_id = msg.get("from", "hub")
@@ -311,7 +310,7 @@ async def handle_message(raw: str, cfg: dict, agent_id: str, ws, dry_run: bool,
             text = inner.get("text", json.dumps(inner))
             from_id = m.get("from", "?")
             log.info("📬 Inbox from %s", from_id[:8])
-            forward_to_agent(cfg, f"[Pincer Inbox from {from_id}]\n{text}", dry_run)
+            await forward_to_agent(cfg, f"[Pincer Inbox from {from_id}]\n{text}", dry_run)
 
     elif msg_type in ("HEARTBEAT_ACK", "heartbeat.ack"):
         inbox = payload.get("inbox") or []
@@ -320,7 +319,7 @@ async def handle_message(raw: str, cfg: dict, agent_id: str, ws, dry_run: bool,
             for m in inbox:
                 inner = (m.get("payload") or {})
                 text = inner.get("text", json.dumps(inner))
-                forward_to_agent(cfg, f"[Pincer Inbox]\n{text}", dry_run)
+                await forward_to_agent(cfg, f"[Pincer Inbox]\n{text}", dry_run)
 
     elif msg_type == "PING":
         await ws.send(make_envelope("PONG", agent_id, "hub", {}))
@@ -460,7 +459,7 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
                         forward_text = f"[Pincer Room context (last {len(ctx_msgs)} msgs)]\n{ctx_str}\n\n[Pincer Room msg from {sender}]\n{content}"
                     else:
                         forward_text = f"[Pincer Room msg from {sender}]\n{content}"
-                    forward_to_agent(cfg, forward_text, dry_run)
+                    await forward_to_agent(cfg, forward_text, dry_run)
         except websockets.exceptions.ConnectionClosed as e:
             log.warning("Room WS disconnected: %s. Retry in %ds...", e, reconnect_delay)
         except OSError as e:
