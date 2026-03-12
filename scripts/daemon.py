@@ -290,7 +290,10 @@ async def handle_message(raw: str, cfg: dict, agent_id: str, ws, dry_run: bool,
         # From field is set by hub from the sender's WS connection — no sender_agent_id in payload
         from_id = msg.get("from", "?")
         text = payload.get("text", "")
-        pincer_url = cfg.get("pincer_url", "").replace("ws://", "http://").replace("wss://", "https://").rstrip("/ws")
+        _raw_url = cfg.get("pincer_url", "")
+        pincer_url = _raw_url.replace("ws://", "http://").replace("wss://", "https://")
+        if pincer_url.endswith("/ws"):
+            pincer_url = pincer_url[:-3]
         log.info("💬 DM from %s: %s", from_id[:8], text[:80])
         reply_hint = (
             f"\nTo reply via Pincer, POST to {pincer_url}/api/v1/messages/send:\n"
@@ -411,7 +414,8 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
     context_window = cfg.get("room_context_window", 5)  # how many recent msgs to include as context
 
     # Convert WS URL back to HTTP base
-    base_url = cfg["pincer_url"].rstrip("/ws").replace("wss://", "https://").replace("ws://", "http://")
+    _raw_base = cfg["pincer_url"].replace("wss://", "https://").replace("ws://", "http://")
+    base_url = _raw_base[:-3] if _raw_base.endswith("/ws") else _raw_base
     room_ws_url = f"{base_url.replace('http://', 'ws://').replace('https://', 'wss://')}/api/v1/rooms/{room_id}/ws?api_key={api_key}"
 
     # Rolling context buffer: keeps last N room messages for context
@@ -471,12 +475,6 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
             log.warning("Room WS unexpected: %s. Retry in %ds...", e, reconnect_delay)
         await asyncio.sleep(reconnect_delay)
         reconnect_delay = min(reconnect_delay * 2, RECONNECT_DELAY_MAX)
-
-    room_task.cancel()
-    try:
-        await room_task
-    except asyncio.CancelledError:
-        pass
 
 
 def main() -> None:
