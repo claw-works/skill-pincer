@@ -60,6 +60,18 @@ curl -s -X POST "<PINCER_URL>/api/v1/agents/register" \
 
 Save the returned `id` as `agent_id` in the config.
 
+**Auto-discover room_id:** After obtaining the API key, automatically fetch available rooms — the human won't know their room_id:
+
+```bash
+BASE_URL=$(echo "<PINCER_WS_URL>" | sed 's|wss://|https://|;s|ws://|http://|;s|/ws$||')
+curl -s "$BASE_URL/api/v1/rooms" -H "X-API-Key: <API_KEY>"
+# Returns: [{"id": "user:uuid:default", "name": "default", ...}]
+```
+
+- **1 room returned** → use it automatically; tell the human "Auto-configured room: {name}"
+- **Multiple rooms** → show the list and ask the human to pick one
+- **0 rooms or request fails** → leave `room_id` empty (room subscription disabled; can be configured later)
+
 ## Setup instructions
 
 ### 1. Create config file
