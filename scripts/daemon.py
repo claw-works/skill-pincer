@@ -467,7 +467,7 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
                     # 3. otherwise → discard (0 token cost)
                     agent_name = cfg.get("agent_name", "")
                     mention_only = cfg.get("room_mention_only", True)
-                    is_mentioned = agent_name and (agent_name in content or f"@{agent_name}" in content)
+                    is_mentioned = agent_name and f"@{agent_name}" in content
                     is_broadcast = "@all" in content or "@所有人" in content
                     if mention_only and not is_mentioned and not is_broadcast:
                         log.debug("💬 Room msg from %s ignored (no mention): %s", sender[:8], content[:40])
