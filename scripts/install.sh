@@ -34,6 +34,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Environment="PATH=$(dirname $(command -v node 2>/dev/null || echo /usr/local/bin/node)):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ExecStart=python3 $DAEMON_SCRIPT --config $CONFIG_PATH
 Restart=always
 RestartSec=10

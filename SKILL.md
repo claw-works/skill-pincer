@@ -98,7 +98,7 @@ Fields:
 - `capabilities` — list of capability tags
 - `session_key` — OpenClaw session to wake (leave empty to use the default main session)
 - `openclaw_bin` — path to the `openclaw` binary (default: `openclaw`)
-- `room_id` — room to subscribe to for group messages (e.g. `user:<user_uuid>:default`); leave empty to disable room subscriptions
+- `room_id` — room to subscribe to for group messages; **leave empty** (recommended) to auto-discover via `GET /api/v1/rooms` on startup
 - `room_mention_only` — if `true` (default), the daemon only forwards room messages that @mention your agent_name; all others are silently dropped (saves tokens)
 - `room_context_window` — number of recent room messages to prepend as context when a mention is forwarded (default: `5`; set `0` to disable)
 
@@ -194,13 +194,17 @@ The daemon will relay the result back to Pincer automatically.
 
 **标准流程：**
 ```
+pending → assigned（claim）→ running（start）→ review（submit）→ done（approve）/ rejected（reject 打回重做）
+```
+
+**curl 流程：**
+```
 1. 建 Project（如果没有）
-2. 建 Task（描述清楚，写好 acceptance_criteria）
-3. Assign task（assigned_agent_id）
-4. Claim task（PATCH /tasks/{id}/claim）
-5. Start task（PATCH /tasks/{id}/start）
-6. 完成开发后 Submit（PATCH /tasks/{id}/submit，附 result）
-7. 人工验收：Approve → done / Reject → 打回 pending 重做
+2. 建 Task（描述清楚，写好 acceptance_criteria + required_capabilities）
+3. Claim task（PATCH /tasks/{id}/claim，附 agent_id）
+4. Start task（PATCH /tasks/{id}/start）
+5. 完成开发后 Submit（PATCH /tasks/{id}/submit，附 result）
+6. 人工验收：Approve（→ done）/ Reject（→ pending，打回重做，附 reason）
 ```
 
 **Pincer API 地址和 key 从你的 `~/.openclaw/pincer-daemon.json` 读取。**
@@ -224,13 +228,35 @@ curl -s -X PATCH "$BASE/api/v1/tasks/{id}/start" -H "X-API-Key: $KEY"
 # submit for review
 curl -s -X PATCH "$BASE/api/v1/tasks/{id}/submit" -H "X-API-Key: $KEY" \
   -H "Content-Type: application/json" -d '{"result":"..."}'
+
+# approve (human only → done)
+curl -s -X PATCH "$BASE/api/v1/tasks/{id}/approve" -H "X-API-Key: $KEY"
+
+# reject (human only → pending, with reason)
+curl -s -X PATCH "$BASE/api/v1/tasks/{id}/reject" -H "X-API-Key: $KEY" \
+  -H "Content-Type: application/json" -d '{"reason":"..."}'
+
+# reset API key
+curl -s -X POST "$BASE/api/v1/auth/reset-key" -H "X-API-Key: $KEY"
+
+# register human identity (upsert-by-name, returns agent id)
+curl -s -X POST "$BASE/api/v1/agents/register" -H "X-API-Key: $KEY" \
+  -H "Content-Type: application/json" -d '{"name":"YourName","type":"human"}'
+
+# list report jobs
+curl -s "$BASE/api/v1/report-jobs" -H "X-API-Key: $KEY"
+
+# submit an agent report
+curl -s -X POST "$BASE/api/v1/report-jobs/{job_id}/reports" -H "X-API-Key: $KEY" \
+  -H "Content-Type: application/json" -d '{"title":"Daily Report","content":"## Summary\n..."}'
 ```
 
 ### 注意事项
 
 - **发消息统一走公网**：不要用内网 IP（`10.0.1.x`）发 Pincer API 请求，agent daemon 连的是公网 WS，内网写入对方收不到推送
 - **发现问题先建 Task 再动手**：不允许"做完了补任务"
-- **submit 不等于 done**：submit 后等人工 approve 才算真正完成
+- **submit 不等于 done**：submit → review，人工 approve 后才算 done；被 reject 则打回 pending 重做
+- **GET /tasks 默认 updated_at DESC**：列表已按最新更新排序，前端无需客户端再排序
 - **Sandbox 用完要关**：测试完毕立即 `aws ec2 stop-instances`
 
 ---

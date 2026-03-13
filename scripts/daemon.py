@@ -480,7 +480,14 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
                         forward_text = f"[Pincer Room context (last {len(ctx_msgs)} msgs)]\n{ctx_str}\n\n[Pincer Room msg from {sender}]\n{content}"
                     else:
                         forward_text = f"[Pincer Room msg from {sender}]\n{content}"
-                    await forward_to_agent(cfg, forward_text, dry_run)
+                    pincer_url = cfg.get("pincer_url", "").replace("ws://", "http://").replace("wss://", "https://").removesuffix("/ws")
+                    reply_hint = (
+                        f"\nTo reply in this room, POST to {pincer_url}/api/v1/rooms/{room_id}/messages:\n"
+                        f'  {{"sender_agent_id": "{agent_id}", "content": "<reply>"}}\n'
+                        f"  Header: X-API-Key: {cfg.get('api_key', '')}\n"
+                        f"Do NOT reply via Feishu or other messaging channels."
+                    )
+                    await forward_to_agent(cfg, forward_text + reply_hint, dry_run)
         except websockets.exceptions.ConnectionClosed as e:
             log.warning("Room WS disconnected: %s. Retry in %ds...", e, reconnect_delay)
         except OSError as e:
