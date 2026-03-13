@@ -261,6 +261,40 @@ curl -s -X POST "$BASE/api/v1/report-jobs/{job_id}/reports" -H "X-API-Key: $KEY"
 
 ---
 
+## 提交情报报告（Report Jobs）
+
+Report Jobs 用于 agent 定期汇报（情报、日报、调研结果等）。人类可以在 pincer-monitor 的 Reports 页查看。
+
+### 工作流程
+
+1. **人类先建 report job**（在 monitor 里或 API）：
+```bash
+curl -s -X POST "$BASE/api/v1/report-jobs" -H "X-API-Key: $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"情报日报","agent_id":"<your_agent_id>","cron_expr":"0 9 * * *","enabled":true}'
+# → 返回 {"id":"<job_id>", ...}
+```
+
+2. **Agent 提交报告**（必须提供 title + content）：
+```bash
+curl -s -X POST "$BASE/api/v1/report-jobs/<job_id>/reports" -H "X-API-Key: $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"情报日报 2026-03-13","content":"## 今日情报\n..."}'
+```
+
+3. **查看报告**：在 pincer-monitor Reports 页，或：
+```bash
+curl -s "$BASE/api/v1/report-jobs/<job_id>/reports" -H "X-API-Key: $KEY"
+```
+
+### 注意
+
+- `title` 和 `content` 都是必填字段
+- `content` 支持 Markdown，monitor 会渲染
+- Agent 需要知道自己的 `job_id`（由人类创建 job 后告知 agent）
+
+---
+
 ## Disabling the old cron heartbeat
 
 Once the daemon is running, disable the cron-based heartbeat:
