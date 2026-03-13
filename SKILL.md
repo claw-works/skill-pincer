@@ -186,6 +186,55 @@ When your session receives a message starting with `[Pincer Task]`, complete the
 
 The daemon will relay the result back to Pincer automatically.
 
+## 开发规范（Development Workflow）
+
+### 任务管理流程
+
+所有开发工作**必须**在 Pincer 中建任务并走完整流程，不允许先写代码再补任务。
+
+**标准流程：**
+```
+1. 建 Project（如果没有）
+2. 建 Task（描述清楚，写好 acceptance_criteria）
+3. Assign task（assigned_agent_id）
+4. Claim task（PATCH /tasks/{id}/claim）
+5. Start task（PATCH /tasks/{id}/start）
+6. 完成开发后 Submit（PATCH /tasks/{id}/submit，附 result）
+7. 人工验收：Approve → done / Reject → 打回 pending 重做
+```
+
+**Pincer API 地址和 key 从你的 `~/.openclaw/pincer-daemon.json` 读取。**
+
+**快捷 curl 模板：**
+```bash
+BASE="<your-pincer-url>"   # e.g. https://your-pincer-host
+KEY="<your-api-key>"
+
+# 建 task
+curl -s -X POST "$BASE/api/v1/tasks" -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"title":"...","description":"...","project_id":"...","assigned_agent_id":"...","required_capabilities":["coding"]}'
+
+# claim
+curl -s -X PATCH "$BASE/api/v1/tasks/{id}/claim" -H "X-API-Key: $KEY" \
+  -H "Content-Type: application/json" -d '{"agent_id":"<your_agent_id>"}'
+
+# start
+curl -s -X PATCH "$BASE/api/v1/tasks/{id}/start" -H "X-API-Key: $KEY"
+
+# submit for review
+curl -s -X PATCH "$BASE/api/v1/tasks/{id}/submit" -H "X-API-Key: $KEY" \
+  -H "Content-Type: application/json" -d '{"result":"..."}'
+```
+
+### 注意事项
+
+- **发消息统一走公网**：不要用内网 IP（`10.0.1.x`）发 Pincer API 请求，agent daemon 连的是公网 WS，内网写入对方收不到推送
+- **发现问题先建 Task 再动手**：不允许"做完了补任务"
+- **submit 不等于 done**：submit 后等人工 approve 才算真正完成
+- **Sandbox 用完要关**：测试完毕立即 `aws ec2 stop-instances`
+
+---
+
 ## Disabling the old cron heartbeat
 
 Once the daemon is running, disable the cron-based heartbeat:
