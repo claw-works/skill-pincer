@@ -88,7 +88,16 @@ async def forward_to_agent(cfg: dict, message: str, dry_run: bool = False) -> No
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
         if proc.returncode == 0:
             import json as _json
-            data = _json.loads(stdout)
+            raw = stdout.decode("utf-8", errors="replace").strip()
+            data = {}
+            try:
+                data = _json.loads(raw)
+            except _json.JSONDecodeError as _je:
+                # Output may have trailing non-JSON content; truncate at error pos
+                try:
+                    data = _json.loads(raw[:_je.pos])
+                except Exception:
+                    pass
             sessions = data.get("sessions", [])
             if session_key:
                 match = [s for s in sessions if session_key in s.get("key", "")]
