@@ -85,7 +85,7 @@ async def forward_to_agent(cfg: dict, message: str, dry_run: bool = False) -> No
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
         if proc.returncode == 0:
             import json as _json
             raw = stdout.decode("utf-8", errors="replace").strip()
