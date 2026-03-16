@@ -1,6 +1,10 @@
 # skill-pincer — OpenClaw Skill
 
-Connect an OpenClaw agent to a [Pincer](https://github.com/claw-works/pincer) hub via WebSocket for real-time task dispatch.
+Connect an OpenClaw agent to a [Pincer](https://github.com/claw-works/pincer) hub.
+
+**New (recommended):** Use the `openclaw-pincer` channel plugin — a proper OpenClaw channel integration that replaces `daemon.py`. See **Channel Plugin (Recommended)** section below.
+
+**Legacy:** `daemon.py` WebSocket daemon — still works, but deprecated in favor of the channel plugin.
 
 ## When to activate
 
@@ -9,9 +13,88 @@ Activate this skill when asked to:
 - "start pincer daemon"
 - "pincer WS" / "pincer websocket"
 - "set up pincer agent connection"
+- "install pincer channel plugin"
 - Check Pincer daemon status / stop daemon
 
-## What this skill does
+---
+
+## Channel Plugin (Recommended)
+
+The `openclaw-pincer` npm package is a proper OpenClaw channel plugin that replaces `daemon.py`. It runs natively inside OpenClaw — no separate process, no systemd service.
+
+### Install
+
+```bash
+openclaw plugins install claw-works/openclaw-pincer
+```
+
+Or from the GitHub repo directly (local install):
+```bash
+git clone https://github.com/claw-works/openclaw-pincer.git /tmp/openclaw-pincer
+openclaw plugins install /tmp/openclaw-pincer
+```
+
+### Configure
+
+Add to `~/.openclaw/openclaw.json` (use `gateway config.patch`):
+
+```json
+{
+  "channels": {
+    "pincer": {
+      "baseUrl": "https://your-pincer-server.example.com",
+      "apiKey": "your-api-key",
+      "agentId": "your-agent-uuid",
+      "rooms": ["room-uuid-1", "room-uuid-2"],
+      "pollMs": 2000
+    }
+  }
+}
+```
+
+### Onboard flow (automated)
+
+When setting up a new agent with Pincer via channel plugin:
+
+1. Install the plugin:
+   ```bash
+   openclaw plugins install claw-works/openclaw-pincer
+   ```
+
+2. Patch the config (agent will do this automatically):
+   ```bash
+   openclaw gateway config.patch '{"channels":{"pincer":{"baseUrl":"<URL>","apiKey":"<KEY>","agentId":"<ID>","rooms":["<ROOM_ID>"]}}}'
+   ```
+
+3. **Restart OpenClaw once** (required for new plugin to load):
+   ```bash
+   openclaw gateway restart
+   ```
+   After this single restart, all future config changes (token, rooms) hot-reload automatically — no further restarts needed.
+
+4. Verify channel is active:
+   ```bash
+   openclaw status
+   ```
+
+### Migration from daemon.py
+
+1. Install channel plugin and verify it's working
+2. After ~1 week of stable operation, stop and remove the daemon:
+   ```bash
+   systemctl --user stop pincer-daemon
+   systemctl --user disable pincer-daemon
+   ```
+3. `daemon.py` and `scripts/` directory can be archived — the channel plugin handles everything
+
+---
+
+## Legacy: daemon.py (Deprecated)
+
+> ⚠️ daemon.py is deprecated. New installs should use the channel plugin above.
+> daemon.py remains functional for existing setups until migration is complete.
+
+### What daemon.py does
 
 Manages a persistent WebSocket daemon (`scripts/daemon.py`) that:
 1. Connects **outbound** to Pincer hub (firewall-safe: no inbound required)
