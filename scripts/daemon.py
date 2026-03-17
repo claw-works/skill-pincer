@@ -409,104 +409,158 @@ async def run_daemon(cfg: dict, dry_run: bool = False) -> None:
 
 
 async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
-    """Subscribe to the Pincer room WebSocket and forward messages to agent session."""
-    room_id = cfg.get("room_id", "").strip()
+    """Subscribe to all Pincer project room WebSockets and forward messages to agent session.
 
-    # Auto-discover room_id if not configured
-    if not room_id:
-        base_url = cfg["pincer_url"].removesuffix("/ws").replace("wss://", "https://").replace("ws://", "http://")
-        api_key = cfg["api_key"]
-        try:
-            loop = asyncio.get_event_loop()
-            import urllib.request as _urllib
-            def _fetch_rooms():
-                req = _urllib.Request(f"{base_url}/api/v1/rooms",
-                    headers={"X-API-Key": api_key})
-                with _urllib.urlopen(req, timeout=5) as r:
-                    return json.loads(r.read())
-            rooms = await loop.run_in_executor(None, _fetch_rooms)
-            if rooms:
-                room_id = rooms[0]["id"]
-                log.info("Room auto-discovered: %s", room_id)
-            else:
-                log.info("No rooms found, room subscription disabled")
-                return
-        except Exception as e:
-            log.warning("Room auto-discover failed: %s — room subscription disabled", e)
-            return
+    Discovers rooms from:
+    1. cfg["room_id"]    — static room (e.g. user default room)
+    2. GET /projects     — one room per project (room_id field)
+
+    Refreshes project list every PROJECT_REFRESH_INTERVAL seconds so newly
+    created projects are picked up automatically.
+    """
+    PROJECT_REFRESH_INTERVAL = 60  # seconds
 
     agent_id = cfg["agent_id"]
     api_key = cfg["api_key"]
-    context_window = cfg.get("room_context_window", 5)  # how many recent msgs to include as context
+    agent_name = cfg.get("agent_name", "")
+    mention_only = cfg.get("room_mention_only", True)
+    context_window = cfg.get("room_context_window", 5)
 
-    # Convert WS URL back to HTTP base
     base_url = cfg["pincer_url"].removesuffix("/ws").replace("wss://", "https://").replace("ws://", "http://")
-    room_ws_url = f"{base_url.replace('http://', 'ws://').replace('https://', 'wss://')}/api/v1/rooms/{room_id}/ws?api_key={api_key}"
 
-    # Rolling context buffer: keeps last N room messages for context
-    context_buf: collections.deque = collections.deque(maxlen=max(context_window, 1))
-
-    reconnect_delay = RECONNECT_DELAY_BASE
-    log.info("Room WS: subscribing to room %s", room_id)
-    while True:
+    def _fetch_project_rooms() -> list[str]:
+        """Return list of room_ids from /projects endpoint."""
+        import urllib.request as _urllib
         try:
-            async with websockets.connect(room_ws_url, ping_interval=None, close_timeout=5) as ws:
-                reconnect_delay = RECONNECT_DELAY_BASE
-                log.info("Room WS: connected to room %s", room_id)
-                async for raw in ws:
-                    try:
-                        msg = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-                    msg_type = msg.get("type", "")
-                    if msg_type != "room.message":
-                        continue
-                    data = msg.get("data") or msg.get("payload") or {}
-                    sender = data.get("sender_agent_id", "unknown")
-                    content = data.get("content", "")
-                    # Don't forward messages sent by this agent (would loop)
-                    if sender == agent_id:
-                        context_buf.append(f"[{sender[:8]}(me)]: {content}")
-                        continue
-                    # Add to context buffer before filtering
-                    context_buf.append(f"[{sender[:8]}]: {content}")
-                    # Forward rules (mention_only mode, default true):
-                    # 1. @agent名字 → forward to this agent
-                    # 2. @all or @所有人 → broadcast, forward to all agents
-                    # 3. otherwise → discard (0 token cost)
-                    agent_name = cfg.get("agent_name", "")
-                    mention_only = cfg.get("room_mention_only", True)
-                    is_mentioned = agent_name and f"@{agent_name}" in content
-                    is_broadcast = "@all" in content or "@所有人" in content
-                    if mention_only and not is_mentioned and not is_broadcast:
-                        log.debug("💬 Room msg from %s ignored (no mention): %s", sender[:8], content[:40])
-                        continue
-                    log.info("💬 Room msg from %s: %s", sender[:8], content[:60])
-                    # Build context string from recent messages (excluding the current one)
-                    ctx_msgs = list(context_buf)[:-1]  # all except the triggering message
-                    if ctx_msgs and context_window > 0:
-                        ctx_str = "\n".join(ctx_msgs)
-                        forward_text = f"[Pincer Room context (last {len(ctx_msgs)} msgs)]\n{ctx_str}\n\n[Pincer Room msg from {sender}]\n{content}"
-                    else:
-                        forward_text = f"[Pincer Room msg from {sender}]\n{content}"
-                    pincer_url = cfg.get("pincer_url", "").replace("ws://", "http://").replace("wss://", "https://").removesuffix("/ws")
-                    reply_hint = (
-                        f"\nTo reply in this room, POST to {pincer_url}/api/v1/rooms/{room_id}/messages:\n"
-                        f'  {{"sender_agent_id": "{agent_id}", "content": "<reply>"}}\n'
-                        f"  Header: X-API-Key: {cfg.get('api_key', '')}\n"
-                        f"Do NOT reply via Feishu or other messaging channels."
-                    )
-                    await forward_to_agent(cfg, forward_text + reply_hint, dry_run)
-        except websockets.exceptions.ConnectionClosed as e:
-            log.warning("Room WS disconnected: %s. Retry in %ds...", e, reconnect_delay)
-        except OSError as e:
-            log.warning("Room WS error: %s. Retry in %ds...", e, reconnect_delay)
-        except asyncio.CancelledError:
-            break
+            req = _urllib.Request(f"{base_url}/api/v1/projects",
+                headers={"X-API-Key": api_key})
+            with _urllib.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read())
+            rooms = [p["room_id"] for p in (data if isinstance(data, list) else []) if p.get("room_id")]
+            return rooms
         except Exception as e:
-            log.warning("Room WS unexpected: %s. Retry in %ds...", e, reconnect_delay)
-        await asyncio.sleep(reconnect_delay)
-        reconnect_delay = min(reconnect_delay * 2, RECONNECT_DELAY_MAX)
+            log.warning("Failed to fetch project rooms: %s", e)
+            return []
+
+    def _fetch_default_rooms() -> list[str]:
+        """Return room_ids from /rooms (legacy auto-discover)."""
+        import urllib.request as _urllib
+        try:
+            req = _urllib.Request(f"{base_url}/api/v1/rooms",
+                headers={"X-API-Key": api_key})
+            with _urllib.urlopen(req, timeout=5) as r:
+                data = json.loads(r.read())
+            return [r["id"] for r in (data if isinstance(data, list) else []) if r.get("id")]
+        except Exception as e:
+            log.warning("Failed to fetch default rooms: %s", e)
+            return []
+
+    # Collect initial room set
+    static_room = cfg.get("room_id", "").strip()
+    active_rooms: dict[str, asyncio.Task] = {}  # room_id → subscriber task
+    context_bufs: dict[str, collections.deque] = {}  # room_id → rolling context
+
+    async def subscribe_room(room_id: str) -> None:
+        """Long-running coroutine: subscribe to one room WS and forward mentions."""
+        ws_url = f"{base_url.replace('http://', 'ws://').replace('https://', 'wss://')}/api/v1/rooms/{room_id}/ws?api_key={api_key}"
+        buf = context_bufs.setdefault(room_id, collections.deque(maxlen=max(context_window, 1)))
+        reconnect_delay = RECONNECT_DELAY_BASE
+        log.info("Room WS: subscribing to room %s", room_id)
+        while True:
+            try:
+                async with websockets.connect(ws_url, ping_interval=None, close_timeout=5) as ws:
+                    reconnect_delay = RECONNECT_DELAY_BASE
+                    log.info("Room WS: connected to room %s", room_id)
+                    async for raw in ws:
+                        try:
+                            msg = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        msg_type = msg.get("type", "")
+                        if msg_type != "room.message":
+                            continue
+                        data = msg.get("data") or msg.get("payload") or {}
+                        sender = data.get("sender_agent_id", "unknown")
+                        content = data.get("content", "")
+                        if sender == agent_id:
+                            buf.append(f"[{sender[:8]}(me)]: {content}")
+                            continue
+                        buf.append(f"[{sender[:8]}]: {content}")
+                        is_mentioned = agent_name and f"@{agent_name}" in content
+                        is_broadcast = "@all" in content or "@所有人" in content
+                        if mention_only and not is_mentioned and not is_broadcast:
+                            log.debug("💬 Room %s: ignored (no mention): %s", room_id[:8], content[:40])
+                            continue
+                        log.info("💬 Room %s msg from %s: %s", room_id[:8], sender[:8], content[:60])
+                        ctx_msgs = list(buf)[:-1]
+                        if ctx_msgs and context_window > 0:
+                            ctx_str = "\n".join(ctx_msgs)
+                            forward_text = (
+                                f"[Pincer Room context (last {len(ctx_msgs)} msgs)]\n{ctx_str}\n\n"
+                                f"[Pincer Room msg from {sender}]\n{content}"
+                            )
+                        else:
+                            forward_text = f"[Pincer Room msg from {sender}]\n{content}"
+                        reply_hint = (
+                            f"\nTo reply in this room, POST to {base_url}/api/v1/rooms/{room_id}/messages:\n"
+                            f'  {{"sender_agent_id": "{agent_id}", "content": "<reply>"}}\n'
+                            f"  Header: X-API-Key: {api_key}\n"
+                            f"Do NOT reply via Feishu or other messaging channels."
+                        )
+                        await forward_to_agent(cfg, forward_text + reply_hint, dry_run)
+            except websockets.exceptions.ConnectionClosed as e:
+                log.warning("Room WS %s disconnected: %s. Retry in %ds...", room_id[:8], e, reconnect_delay)
+            except OSError as e:
+                log.warning("Room WS %s error: %s. Retry in %ds...", room_id[:8], e, reconnect_delay)
+            except asyncio.CancelledError:
+                log.info("Room WS %s cancelled.", room_id[:8])
+                return
+            except Exception as e:
+                log.warning("Room WS %s unexpected: %s. Retry in %ds...", room_id[:8], e, reconnect_delay)
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, RECONNECT_DELAY_MAX)
+
+    def ensure_rooms(room_ids: list[str]) -> None:
+        """Start subscriber tasks for any new room_ids not yet tracked."""
+        for rid in room_ids:
+            if rid and rid not in active_rooms:
+                log.info("Room WS: adding new room %s", rid)
+                active_rooms[rid] = asyncio.create_task(subscribe_room(rid))
+
+    # Initial discovery
+    loop = asyncio.get_event_loop()
+    initial_rooms = []
+    if static_room:
+        initial_rooms.append(static_room)
+    project_rooms = await loop.run_in_executor(None, _fetch_project_rooms)
+    if project_rooms:
+        initial_rooms.extend(project_rooms)
+    elif not static_room:
+        # Fallback: legacy /rooms endpoint
+        default_rooms = await loop.run_in_executor(None, _fetch_default_rooms)
+        initial_rooms.extend(default_rooms)
+
+    if not initial_rooms:
+        log.info("No rooms found at startup, will retry on next refresh.")
+    ensure_rooms(initial_rooms)
+
+    # Refresh loop: periodically re-fetch projects and subscribe to new rooms
+    try:
+        while True:
+            await asyncio.sleep(PROJECT_REFRESH_INTERVAL)
+            new_project_rooms = await loop.run_in_executor(None, _fetch_project_rooms)
+            all_rooms = ([static_room] if static_room else []) + new_project_rooms
+            ensure_rooms(all_rooms)
+            # Clean up finished tasks
+            for rid in list(active_rooms):
+                if active_rooms[rid].done():
+                    log.warning("Room WS task for %s ended unexpectedly", rid)
+                    del active_rooms[rid]
+    except asyncio.CancelledError:
+        log.info("Room refresh loop cancelled, shutting down all room WS tasks.")
+        for task in active_rooms.values():
+            task.cancel()
+        await asyncio.gather(*active_rooms.values(), return_exceptions=True)
 
 
 def main() -> None:
