@@ -433,7 +433,7 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
         import urllib.request as _urllib
         try:
             req = _urllib.Request(f"{base_url}/api/v1/projects",
-                headers={"X-API-Key": api_key})
+                headers={"X-API-Key": api_key, "User-Agent": "pincer-daemon/1.0"})
             with _urllib.urlopen(req, timeout=10) as r:
                 data = json.loads(r.read())
             rooms = [p["room_id"] for p in (data if isinstance(data, list) else []) if p.get("room_id")]
@@ -447,7 +447,7 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
         import urllib.request as _urllib
         try:
             req = _urllib.Request(f"{base_url}/api/v1/rooms",
-                headers={"X-API-Key": api_key})
+                headers={"X-API-Key": api_key, "User-Agent": "pincer-daemon/1.0"})
             with _urllib.urlopen(req, timeout=5) as r:
                 data = json.loads(r.read())
             return [r["id"] for r in (data if isinstance(data, list) else []) if r.get("id")]
