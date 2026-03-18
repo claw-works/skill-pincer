@@ -330,6 +330,36 @@ async def handle_message(raw: str, cfg: dict, agent_id: str, ws, dry_run: bool,
                 text = inner.get("text", json.dumps(inner))
                 await forward_to_agent(cfg, f"[Pincer Inbox]\n{text}", dry_run)
 
+    elif msg_type == "room.message":
+        # Hub pushes room messages to the main WS connection as well.
+        # Apply the same mention-only logic used in subscribe_room().
+        data = msg.get("data") or msg.get("payload") or {}
+        sender = data.get("sender_agent_id", "unknown")
+        content = data.get("content", "")
+        room_id = data.get("room_id", msg.get("room_id", ""))
+        if sender == agent_id or not content:
+            return
+        agent_name_cfg = cfg.get("agent_name", "")
+        mention_only = cfg.get("room_mention_only", True)
+        is_mentioned = agent_name_cfg and f"@{agent_name_cfg}" in content
+        is_broadcast = "@all" in content or "@所有人" in content
+        if mention_only and not is_mentioned and not is_broadcast:
+            log.debug("💬 Room %s: ignored via hub (no mention): %s", room_id[:8] if room_id else "?", content[:40])
+            return
+        log.info("💬 Room %s msg (hub WS) from %s: %s", room_id[:8] if room_id else "?", sender[:8], content[:60])
+        base_url = cfg.get("pincer_url", "").replace("ws://", "http://").replace("wss://", "https://").removesuffix("/ws")
+        api_key = cfg.get("api_key", "")
+        forward_text = f"[Pincer Room msg from {sender}]\n{content}"
+        if room_id:
+            reply_hint = (
+                f"\nTo reply in this room, POST to {base_url}/api/v1/rooms/{room_id}/messages:\n"
+                f'  {{"sender_agent_id": "{agent_id}", "content": "<reply>"}}\n'
+                f"  Header: X-API-Key: {api_key}\n"
+                f"Do NOT reply via Feishu or other messaging channels."
+            )
+            forward_text += reply_hint
+        await forward_to_agent(cfg, forward_text, dry_run)
+
     elif msg_type == "PING":
         await ws.send(make_envelope("PONG", agent_id, "hub", {}))
 
