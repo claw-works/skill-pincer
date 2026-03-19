@@ -20,6 +20,7 @@ import signal
 import sys
 import threading
 import time
+import urllib.request as _urllib_req
 import uuid
 from pathlib import Path
 
@@ -300,12 +301,19 @@ async def handle_message(raw: str, cfg: dict, agent_id: str, ws, dry_run: bool,
         text = payload.get("text", "")
         pincer_url = cfg.get("pincer_url", "").replace("ws://", "http://").replace("wss://", "https://").removesuffix("/ws")
         log.info("💬 DM from %s: %s", from_id[:8], text[:80])
+        # Structured route header so agent can reliably parse routing info
+        route_header = (
+            f"[Pincer Route]\n"
+            f"type: dm\n"
+            f"from_agent_id: {from_id}\n"
+            f"my_agent_id: {agent_id}\n"
+        )
         reply_hint = (
-            f"\nTo reply via Pincer, POST to {pincer_url}/api/v1/messages/send:\n"
+            f"\nTo reply via Pincer DM, POST to {pincer_url}/api/v1/messages/send:\n"
             f'  {{"from_agent_id": "{agent_id}", "to_agent_id": "{from_id}", "payload": {{"text": "<reply>"}}}}\n'
             f"  Header: X-API-Key: {cfg.get('api_key', '')}"
         )
-        await forward_to_agent(cfg, f"[Pincer DM from {from_id}]\n{text}{reply_hint}", dry_run)
+        await forward_to_agent(cfg, f"{route_header}\n[Pincer DM from {from_id}]\n{text}{reply_hint}", dry_run)
 
     elif msg_type in ("broadcast", "BROADCAST"):
         from_id = msg.get("from", "hub")
@@ -329,36 +337,6 @@ async def handle_message(raw: str, cfg: dict, agent_id: str, ws, dry_run: bool,
                 inner = (m.get("payload") or {})
                 text = inner.get("text", json.dumps(inner))
                 await forward_to_agent(cfg, f"[Pincer Inbox]\n{text}", dry_run)
-
-    elif msg_type == "room.message":
-        # Hub pushes room messages to the main WS connection as well.
-        # Apply the same mention-only logic used in subscribe_room().
-        data = msg.get("data") or msg.get("payload") or {}
-        sender = data.get("sender_agent_id", "unknown")
-        content = data.get("content", "")
-        room_id = data.get("room_id", msg.get("room_id", ""))
-        if sender == agent_id or not content:
-            return
-        agent_name_cfg = cfg.get("agent_name", "")
-        mention_only = cfg.get("room_mention_only", True)
-        is_mentioned = agent_name_cfg and f"@{agent_name_cfg}" in content
-        is_broadcast = "@all" in content or "@所有人" in content
-        if mention_only and not is_mentioned and not is_broadcast:
-            log.debug("💬 Room %s: ignored via hub (no mention): %s", room_id[:8] if room_id else "?", content[:40])
-            return
-        log.info("💬 Room %s msg (hub WS) from %s: %s", room_id[:8] if room_id else "?", sender[:8], content[:60])
-        base_url = cfg.get("pincer_url", "").replace("ws://", "http://").replace("wss://", "https://").removesuffix("/ws")
-        api_key = cfg.get("api_key", "")
-        forward_text = f"[Pincer Room msg from {sender}]\n{content}"
-        if room_id:
-            reply_hint = (
-                f"\nTo reply in this room, POST to {base_url}/api/v1/rooms/{room_id}/messages:\n"
-                f'  {{"sender_agent_id": "{agent_id}", "content": "<reply>"}}\n'
-                f"  Header: X-API-Key: {api_key}\n"
-                f"Do NOT reply via Feishu or other messaging channels."
-            )
-            forward_text += reply_hint
-        await forward_to_agent(cfg, forward_text, dry_run)
 
     elif msg_type == "PING":
         await ws.send(make_envelope("PONG", agent_id, "hub", {}))
@@ -384,6 +362,9 @@ async def run_daemon(cfg: dict, dry_run: bool = False) -> None:
 
     # Run room WS loop concurrently (if room_id configured)
     room_task = asyncio.create_task(run_room_loop(cfg, dry_run))
+
+    # Run DM inbox poll loop (HTTP polling for reliable DM delivery)
+    inbox_task = asyncio.create_task(run_inbox_poll_loop(cfg, dry_run))
 
     reconnect_delay = RECONNECT_DELAY_BASE
     while True:
@@ -436,6 +417,100 @@ async def run_daemon(cfg: dict, dry_run: bool = False) -> None:
         await room_task
     except asyncio.CancelledError:
         pass
+    inbox_task.cancel()
+    try:
+        await inbox_task
+    except asyncio.CancelledError:
+        pass
+
+
+async def run_inbox_poll_loop(cfg: dict, dry_run: bool = False) -> None:
+    """
+    HTTP inbox polling loop for reliable DM delivery.
+
+    Polls GET /api/v1/agents/{id}/inbox every inbox_poll_interval seconds.
+    Uses message IDs for deduplication to avoid double-forwarding.
+    This is the primary DM delivery path; WS MESSAGE events are supplementary.
+    """
+    agent_id = cfg["agent_id"]
+    api_key = cfg["api_key"]
+    base_url = cfg["pincer_url"].removesuffix("/ws").replace("wss://", "https://").replace("ws://", "http://")
+    poll_interval = cfg.get("inbox_poll_interval", 10)  # seconds, default 10s
+
+    seen_ids: collections.deque = collections.deque(maxlen=SEEN_MAXLEN)
+    seen_set: set = set()
+
+
+
+    log.info("DM inbox poll: starting (interval=%ds)", poll_interval)
+    while True:
+        try:
+            await asyncio.sleep(poll_interval)
+            loop = asyncio.get_event_loop()
+
+            def _fetch_inbox():
+                req = _urllib_req.Request(
+                    f"{base_url}/api/v1/agents/{agent_id}/inbox",
+                    headers={"X-API-Key": api_key, "User-Agent": "pincer-daemon/1.0"}
+                )
+                try:
+                    with _urllib_req.urlopen(req, timeout=10) as r:
+                        raw = r.read()
+                        if not raw or raw == b"null":
+                            return []
+                        data = json.loads(raw)
+                        return data if isinstance(data, list) else []
+                except Exception as e:
+                    log.warning("DM inbox poll error: %s", e)
+                    return []
+
+            msgs = await loop.run_in_executor(None, _fetch_inbox)
+            if not msgs:
+                continue
+
+            log.info("DM inbox: %d message(s)", len(msgs))
+            for m in msgs:
+                msg_id = m.get("id") or m.get("ID") or ""
+                if msg_id and msg_id in seen_set:
+                    log.debug("DM inbox: skipping duplicate %s", msg_id[:8])
+                    continue
+                if msg_id:
+                    seen_ids.append(msg_id)
+                    seen_set.add(msg_id)
+                    while len(seen_set) > SEEN_MAXLEN:
+                        oldest = seen_ids.popleft()
+                        seen_set.discard(oldest)
+
+                # Extract message content
+                from_id = m.get("from") or m.get("From") or m.get("sender_agent_id") or "?"
+                msg_type = (m.get("type") or m.get("Type") or "").lower()
+                payload_data = m.get("payload") or m.get("Payload") or {}
+                text = payload_data.get("text") or payload_data.get("content") or json.dumps(payload_data)
+
+                # Skip messages sent by self
+                if from_id == agent_id:
+                    continue
+
+                log.info("💬 DM inbox from %s (id=%s): %s", from_id[:8], msg_id[:8] if msg_id else "?", text[:80])
+
+                route_header = (
+                    f"[Pincer Route]\n"
+                    f"type: dm\n"
+                    f"from_agent_id: {from_id}\n"
+                    f"my_agent_id: {agent_id}\n"
+                )
+                reply_hint = (
+                    f"\nTo reply via Pincer DM, POST to {base_url}/api/v1/messages/send:\n"
+                    f'  {{"from_agent_id": "{agent_id}", "to_agent_id": "{from_id}", "payload": {{"text": "<reply>"}}}}\n'
+                    f"  Header: X-API-Key: {api_key}"
+                )
+                await forward_to_agent(cfg, f"{route_header}\n[Pincer DM from {from_id}]\n{text}{reply_hint}", dry_run)
+
+        except asyncio.CancelledError:
+            log.info("DM inbox poll loop cancelled.")
+            return
+        except Exception as e:
+            log.warning("DM inbox poll loop error: %s", e)
 
 
 async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
@@ -460,11 +535,11 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
 
     def _fetch_project_rooms() -> list[str]:
         """Return list of room_ids from /projects endpoint."""
-        import urllib.request as _urllib
+    
         try:
-            req = _urllib.Request(f"{base_url}/api/v1/projects",
+            req = _urllib_req.Request(f"{base_url}/api/v1/projects",
                 headers={"X-API-Key": api_key, "User-Agent": "pincer-daemon/1.0"})
-            with _urllib.urlopen(req, timeout=10) as r:
+            with _urllib_req.urlopen(req, timeout=10) as r:
                 data = json.loads(r.read())
             rooms = [p["room_id"] for p in (data if isinstance(data, list) else []) if p.get("room_id")]
             return rooms
@@ -474,11 +549,11 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
 
     def _fetch_default_rooms() -> list[str]:
         """Return room_ids from /rooms (legacy auto-discover)."""
-        import urllib.request as _urllib
+    
         try:
-            req = _urllib.Request(f"{base_url}/api/v1/rooms",
+            req = _urllib_req.Request(f"{base_url}/api/v1/rooms",
                 headers={"X-API-Key": api_key, "User-Agent": "pincer-daemon/1.0"})
-            with _urllib.urlopen(req, timeout=5) as r:
+            with _urllib_req.urlopen(req, timeout=5) as r:
                 data = json.loads(r.read())
             return [r["id"] for r in (data if isinstance(data, list) else []) if r.get("id")]
         except Exception as e:
@@ -523,14 +598,23 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
                             continue
                         log.info("💬 Room %s msg from %s: %s", room_id[:8], sender[:8], content[:60])
                         ctx_msgs = list(buf)[:-1]
+                        # Structured route header for reliable agent-side parsing
+                        route_header = (
+                            f"[Pincer Route]\n"
+                            f"type: room\n"
+                            f"room_id: {room_id}\n"
+                            f"from_agent_id: {sender}\n"
+                            f"my_agent_id: {agent_id}\n"
+                        )
                         if ctx_msgs and context_window > 0:
                             ctx_str = "\n".join(ctx_msgs)
                             forward_text = (
+                                f"{route_header}\n"
                                 f"[Pincer Room context (last {len(ctx_msgs)} msgs)]\n{ctx_str}\n\n"
                                 f"[Pincer Room msg from {sender}]\n{content}"
                             )
                         else:
-                            forward_text = f"[Pincer Room msg from {sender}]\n{content}"
+                            forward_text = f"{route_header}\n[Pincer Room msg from {sender}]\n{content}"
                         reply_hint = (
                             f"\nTo reply in this room, POST to {base_url}/api/v1/rooms/{room_id}/messages:\n"
                             f'  {{"sender_agent_id": "{agent_id}", "content": "<reply>"}}\n'
