@@ -299,7 +299,10 @@ async def handle_message(raw: str, cfg: dict, agent_id: str, ws, dry_run: bool,
         # From field is set by hub from the sender's WS connection — no sender_agent_id in payload
         from_id = msg.get("from", "?")
         text = payload.get("text", "")
-        pincer_url = cfg.get("pincer_url", "").replace("ws://", "http://").replace("wss://", "https://").removesuffix("/ws")
+        _raw_url = cfg.get("pincer_url", "")
+        pincer_url = _raw_url.replace("ws://", "http://").replace("wss://", "https://")
+        if pincer_url.endswith("/ws"):
+            pincer_url = pincer_url[:-3]
         log.info("💬 DM from %s: %s", from_id[:8], text[:80])
         # Structured route header so agent can reliably parse routing info
         route_header = (
@@ -531,7 +534,8 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
     mention_only = cfg.get("room_mention_only", True)
     context_window = cfg.get("room_context_window", 5)
 
-    base_url = cfg["pincer_url"].removesuffix("/ws").replace("wss://", "https://").replace("ws://", "http://")
+    _raw_base = cfg["pincer_url"].replace("wss://", "https://").replace("ws://", "http://")
+    base_url = _raw_base[:-3] if _raw_base.endswith("/ws") else _raw_base
 
     def _fetch_project_rooms() -> list[str]:
         """Return list of room_ids from /projects endpoint."""
