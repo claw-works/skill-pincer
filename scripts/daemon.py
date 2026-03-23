@@ -620,6 +620,21 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
                             log.debug("💬 Room %s: ignored (no mention): %s", room_id[:8], content[:40])
                             continue
                         log.info("💬 Room %s msg from %s: %s", room_id[:8], sender[:8], content[:60])
+                        # Immediately push agent_replying so the sender sees the read receipt / typing indicator
+                        import aiohttp as _aiohttp  # noqa: PLC0415 – local import to avoid hard dep at module level
+                        _typing_url = f"{base_url}/api/v1/rooms/{room_id}/typing"
+                        _typing_headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
+
+                        async def _push_typing(event: str) -> None:
+                            try:
+                                _p = json.dumps({"agent_id": agent_id, "event": event})
+                                async with _aiohttp.ClientSession() as _s:
+                                    await _s.post(_typing_url, data=_p, headers=_typing_headers,
+                                                  timeout=_aiohttp.ClientTimeout(total=5))
+                            except Exception as _te:
+                                log.debug("%s push failed (non-fatal): %s", event, _te)
+
+                        await _push_typing("agent_replying")
                         ctx_msgs = list(buf)[:-1]
                         # Structured route header for reliable agent-side parsing
                         route_header = (
@@ -645,6 +660,8 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
                             f"Do NOT reply via Feishu or other messaging channels."
                         )
                         await forward_to_agent(cfg, forward_text + reply_hint, dry_run)
+                        # Push agent_replying_done after the agent has been handed the message
+                        await _push_typing("agent_replying_done")
             except websockets.exceptions.ConnectionClosed as e:
                 log.warning("Room WS %s disconnected: %s. Retry in %ds...", room_id[:8], e, reconnect_delay)
             except OSError as e:
