@@ -68,6 +68,26 @@ def load_config(path: str) -> dict:
 # OpenClaw forwarding — invoke agent via CLI (#2 fix: session_key optional)
 # ---------------------------------------------------------------------------
 
+
+async def send_typing(cfg: dict, room_id: str, event: str) -> None:
+    """Send agent_replying / agent_replying_done to Pincer room typing endpoint."""
+    base_url = cfg["pincer_url"]
+    if base_url.startswith("ws"):
+        base_url = base_url.replace("wss://", "https://").replace("ws://", "http://")
+    base_url = base_url.rstrip("/ws").rstrip("/")
+    api_key = cfg["api_key"]
+    agent_id = cfg["agent_id"]
+    url = f"{base_url}/api/v1/rooms/{room_id}/typing"
+    body = json.dumps({"agent_id": agent_id, "event": event}).encode()
+    try:
+        req = _urllib_req.Request(url, data=body, headers={"X-API-Key": api_key, "Content-Type": "application/json"}, method="POST")
+        with _urllib_req.urlopen(req, timeout=5):
+            pass
+        log.debug("Typing event sent: %s → room %s", event, room_id[:8])
+    except Exception as e:
+        log.debug("Typing event failed (%s): %s", event, e)
+
+
 async def forward_to_agent(cfg: dict, message: str, dry_run: bool = False) -> None:
     """Trigger an OpenClaw agent session turn with `message` as input."""
     if dry_run:
@@ -117,13 +137,17 @@ async def forward_to_agent(cfg: dict, message: str, dry_run: bool = False) -> No
         log.warning("Session lookup failed: %s", e)
 
     try:
-        # Fire-and-forget — agent turns can take 30-120s; don't await
-        await asyncio.create_subprocess_exec(
+        proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
         log.info("Forwarded to OpenClaw agent (background)")
+        # Wait for agent turn to complete (up to 180s)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=180)
+        except asyncio.TimeoutError:
+            log.warning("Agent turn timed out after 180s")
     except FileNotFoundError:
         log.error("openclaw binary not found at: %s", bin_)
     except Exception as e:
@@ -621,16 +645,16 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
                             continue
                         log.info("💬 Room %s msg from %s: %s", room_id[:8], sender[:8], content[:60])
                         # Immediately push agent_replying so the sender sees the read receipt / typing indicator
-                        import aiohttp as _aiohttp  # noqa: PLC0415 – local import to avoid hard dep at module level
                         _typing_url = f"{base_url}/api/v1/rooms/{room_id}/typing"
                         _typing_headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
 
                         async def _push_typing(event: str) -> None:
                             try:
-                                _p = json.dumps({"agent_id": agent_id, "event": event})
-                                async with _aiohttp.ClientSession() as _s:
-                                    await _s.post(_typing_url, data=_p, headers=_typing_headers,
-                                                  timeout=_aiohttp.ClientTimeout(total=5))
+                                _p = json.dumps({"agent_id": agent_id, "event": event}).encode()
+                                _req = _urllib_req.Request(_typing_url, data=_p, headers=_typing_headers, method="POST")
+                                await asyncio.get_event_loop().run_in_executor(
+                                    None, lambda: _urllib_req.urlopen(_req, timeout=5).close()
+                                )
                             except Exception as _te:
                                 log.debug("%s push failed (non-fatal): %s", event, _te)
 
