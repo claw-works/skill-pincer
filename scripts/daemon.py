@@ -684,8 +684,7 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
                             f"Do NOT reply via Feishu or other messaging channels."
                         )
                         await forward_to_agent(cfg, forward_text + reply_hint, dry_run)
-                        # Push agent_replying_done after the agent has been handed the message
-                        await _push_typing("agent_replying_done")
+                        # Note: agent_replying_done is pushed by the server when the agent's message is posted.
             except websockets.exceptions.ConnectionClosed as e:
                 log.warning("Room WS %s disconnected: %s. Retry in %ds...", room_id[:8], e, reconnect_delay)
             except OSError as e:
