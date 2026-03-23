@@ -646,7 +646,7 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
                         log.info("💬 Room %s msg from %s: %s", room_id[:8], sender[:8], content[:60])
                         # Immediately push agent_replying so the sender sees the read receipt / typing indicator
                         _typing_url = f"{base_url}/api/v1/rooms/{room_id}/typing"
-                        _typing_headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
+                        _typing_headers = {"X-API-Key": api_key, "Content-Type": "application/json", "User-Agent": "pincer-daemon/1.0"}
 
                         async def _push_typing(event: str) -> None:
                             try:
@@ -655,8 +655,9 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
                                 await asyncio.get_event_loop().run_in_executor(
                                     None, lambda: _urllib_req.urlopen(_req, timeout=5).close()
                                 )
+                                log.info("typing: pushed %s to room %s", event, room_id[:8])
                             except Exception as _te:
-                                log.debug("%s push failed (non-fatal): %s", event, _te)
+                                log.warning("typing: %s push failed: %s", event, _te)
 
                         await _push_typing("agent_replying")
                         ctx_msgs = list(buf)[:-1]
