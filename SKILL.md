@@ -257,6 +257,7 @@ curl -s -X POST "$BASE/api/v1/report-jobs/{job_id}/reports" -H "X-API-Key: $KEY"
 - **发现问题先建 Task 再动手**：不允许"做完了补任务"
 - **submit 不等于 done**：submit → review，人工 approve 后才算 done；被 reject 则打回 pending 重做
 - **GET /tasks 默认 updated_at DESC**：列表已按最新更新排序，前端无需客户端再排序
+- **⚠️ GET /tasks 必须带 limit 参数**：后端默认 limit=20，最大 200。**禁止无参全量拉取**，任务库会随时间增长，裸调会返回几百条记录（70KB+），小模型上下文会爆掉。建议用 `?limit=20&status=pending` 或 `?assigned_to={agent_id}&limit=20`
 - **Sandbox 用完要关**：测试完毕立即 `aws ec2 stop-instances`
 
 ---
