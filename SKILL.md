@@ -218,6 +218,13 @@ KEY="<your-api-key>"
 curl -s -X POST "$BASE/api/v1/tasks" -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
   -d '{"title":"...","description":"...","project_id":"...","assigned_agent_id":"...","required_capabilities":["coding"]}'
 
+# 列任务（轻量，AI 首选）
+curl -s "$BASE/api/v1/tasks/summary" -H "X-API-Key: $KEY"
+curl -s "$BASE/api/v1/tasks/summary?status=pending&limit=20" -H "X-API-Key: $KEY"
+
+# 获取单个任务完整详情（需要 description/result 时用）
+curl -s "$BASE/api/v1/tasks/{id}" -H "X-API-Key: $KEY"
+
 # claim
 curl -s -X PATCH "$BASE/api/v1/tasks/{id}/claim" -H "X-API-Key: $KEY" \
   -H "Content-Type: application/json" -d '{"agent_id":"<your_agent_id>"}'

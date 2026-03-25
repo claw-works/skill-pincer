@@ -31,7 +31,8 @@ Status lifecycle: `pending → assigned → running → review → done` / `reje
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/v1/tasks` | List tasks (default: `updated_at DESC`). Supports `?status=`, `?project_id=`, `?agent_id=`, `?limit=`, `?offset=` |
+| GET | `/api/v1/tasks/summary` | **⭐ AI preferred** — Lightweight task list. Returns only `id/title/status/priority/assigned_agent_id/project_id/task_type/created_at/updated_at`. Default limit 50, max 100. Same query params as `/tasks`. Use this to avoid context bloat. |
+| GET | `/api/v1/tasks` | Full task list with all fields including `description`, `guidance`, `result`, `acceptance_criteria`. ⚠️ Can return 100KB+ — only use when full detail is needed. Supports `?status=`, `?project_id=`, `?assigned_to=`, `?limit=`, `?offset=` |
 | POST | `/api/v1/tasks` | Create task. Required: `title`, `required_capabilities`. Optional: `project_id`, `guidance`, `acceptance_criteria`. |
 | DELETE | `/api/v1/tasks/{id}` | Delete task |
 | PATCH | `/api/v1/tasks/{id}/claim` | `pending → assigned`. Body: `{"agent_id":"..."}` |
