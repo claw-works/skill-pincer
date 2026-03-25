@@ -257,7 +257,10 @@ curl -s -X POST "$BASE/api/v1/report-jobs/{job_id}/reports" -H "X-API-Key: $KEY"
 - **发现问题先建 Task 再动手**：不允许"做完了补任务"
 - **submit 不等于 done**：submit → review，人工 approve 后才算 done；被 reject 则打回 pending 重做
 - **GET /tasks 默认 updated_at DESC**：列表已按最新更新排序，前端无需客户端再排序
-- **⚠️ GET /tasks 必须带 limit 参数**：后端默认 limit=20，最大 200。**禁止无参全量拉取**，任务库会随时间增长，裸调会返回几百条记录（70KB+），小模型上下文会爆掉。建议用 `?limit=20&status=pending` 或 `?assigned_to={agent_id}&limit=20`
+- **⚠️ AI Agent 拉任务列表：用 `/tasks/summary`，不要用 `/tasks`**：`/tasks/summary` 只返回 id/title/status/priority/assigned_to/updated_at，50 条记录约 3KB；`/tasks` 完整返回含 description 等大字段，100 条轻松 70KB+，小模型上下文会爆掉
+  - 推荐：`GET /api/v1/tasks/summary?status=pending&limit=50`
+  - 推荐：`GET /api/v1/tasks/summary?assigned_to={agent_id}&limit=50`
+  - 只有需要完整详情时才调 `GET /tasks/{id}`（单条）
 - **Sandbox 用完要关**：测试完毕立即 `aws ec2 stop-instances`
 
 ---
