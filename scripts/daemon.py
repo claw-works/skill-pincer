@@ -12,6 +12,7 @@ Usage:
 import argparse
 import asyncio
 import collections
+import hashlib
 import json
 import logging
 import os
@@ -42,9 +43,52 @@ HEARTBEAT_INTERVAL = 30   # seconds
 RECONNECT_DELAY_BASE = 5
 RECONNECT_DELAY_MAX = 60
 SEEN_MAXLEN = 1000        # max entries in result listener seen-set (#6)
+CONTENT_DEDUP_TTL = 600   # seconds: ignore same sender+content within this window
+CONTENT_DEDUP_MAXLEN = 500  # max entries in content dedup cache
 
 # Result queue: agent writes results here, send loop picks them up
 _result_queue: queue.Queue = queue.Queue()
+
+
+# ---------------------------------------------------------------------------
+# Content-based deduplication (anti-loop protection)
+# ---------------------------------------------------------------------------
+
+class ContentDeduplicator:
+    """
+    Deduplicate messages by (sender_id, content_hash) within a TTL window.
+    Prevents runaway message loops (e.g. a buggy agent spamming the same text)
+    from burning LLM tokens.
+    """
+
+    def __init__(self, ttl: int = CONTENT_DEDUP_TTL, maxlen: int = CONTENT_DEDUP_MAXLEN):
+        self._ttl = ttl
+        self._maxlen = maxlen
+        # key → last_seen timestamp
+        self._cache: collections.OrderedDict = collections.OrderedDict()
+
+    def _make_key(self, sender_id: str, content: str) -> str:
+        h = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:16]
+        return f"{sender_id}:{h}"
+
+    def is_duplicate(self, sender_id: str, content: str) -> bool:
+        """Return True if this (sender, content) was seen within TTL seconds."""
+        key = self._make_key(sender_id, content)
+        now = time.monotonic()
+        if key in self._cache:
+            if now - self._cache[key] < self._ttl:
+                return True
+            # TTL expired — allow through and refresh
+        # Record / refresh
+        self._cache[key] = now
+        self._cache.move_to_end(key)
+        # Evict oldest entries beyond maxlen
+        while len(self._cache) > self._maxlen:
+            self._cache.popitem(last=False)
+        return False
+
+
+_content_dedup = ContentDeduplicator()
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +583,11 @@ async def run_inbox_poll_loop(cfg: dict, dry_run: bool = False) -> None:
 
                 log.info("💬 DM inbox from %s (id=%s): %s", from_id[:8], msg_id[:8] if msg_id else "?", text[:80])
 
+                # Content dedup: skip if same sender sent same content recently
+                if _content_dedup.is_duplicate(from_id, text):
+                    log.warning("⚠️  DM inbox: duplicate content from %s, skipping (anti-loop)", from_id[:8])
+                    continue
+
                 route_header = (
                     f"[Pincer Route]\n"
                     f"type: dm\n"
@@ -644,6 +693,10 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
                             log.debug("💬 Room %s: ignored (no mention): %s", room_id[:8], content[:40])
                             continue
                         log.info("💬 Room %s msg from %s: %s", room_id[:8], sender[:8], content[:60])
+                        # Content dedup: skip if same sender sent same content recently
+                        if _content_dedup.is_duplicate(sender, content):
+                            log.warning("⚠️  Room %s: duplicate content from %s, skipping (anti-loop)", room_id[:8], sender[:8])
+                            continue
                         # Immediately push agent_replying so the sender sees the read receipt / typing indicator
                         _typing_url = f"{base_url}/api/v1/rooms/{room_id}/typing"
                         _typing_headers = {"X-API-Key": api_key, "Content-Type": "application/json", "User-Agent": "pincer-daemon/1.0"}
