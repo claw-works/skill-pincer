@@ -12,7 +12,6 @@ Usage:
 import argparse
 import asyncio
 import collections
-import hashlib
 import json
 import logging
 import os
@@ -21,7 +20,6 @@ import signal
 import sys
 import threading
 import time
-import urllib.request as _urllib_req
 import uuid
 from pathlib import Path
 
@@ -43,105 +41,9 @@ HEARTBEAT_INTERVAL = 30   # seconds
 RECONNECT_DELAY_BASE = 5
 RECONNECT_DELAY_MAX = 60
 SEEN_MAXLEN = 1000        # max entries in result listener seen-set (#6)
-CONTENT_DEDUP_TTL = 600   # seconds: ignore same sender+content within this window
-CONTENT_DEDUP_MAXLEN = 500  # max entries in content dedup cache
-ROOM_MSG_ID_MAXLEN = 2000  # max room message IDs persisted for dedup across restarts
 
 # Result queue: agent writes results here, send loop picks them up
 _result_queue: queue.Queue = queue.Queue()
-
-
-# ---------------------------------------------------------------------------
-# Content-based deduplication (anti-loop protection)
-# ---------------------------------------------------------------------------
-
-class ContentDeduplicator:
-    """
-    Deduplicate messages by (sender_id, content_hash) within a TTL window.
-    Prevents runaway message loops (e.g. a buggy agent spamming the same text)
-    from burning LLM tokens.
-    """
-
-    def __init__(self, ttl: int = CONTENT_DEDUP_TTL, maxlen: int = CONTENT_DEDUP_MAXLEN):
-        self._ttl = ttl
-        self._maxlen = maxlen
-        # key → last_seen timestamp
-        self._cache: collections.OrderedDict = collections.OrderedDict()
-
-    def _make_key(self, sender_id: str, content: str) -> str:
-        h = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:16]
-        return f"{sender_id}:{h}"
-
-    def is_duplicate(self, sender_id: str, content: str) -> bool:
-        """Return True if this (sender, content) was seen within TTL seconds."""
-        key = self._make_key(sender_id, content)
-        now = time.monotonic()
-        if key in self._cache:
-            if now - self._cache[key] < self._ttl:
-                return True
-            # TTL expired — allow through and refresh
-        # Record / refresh
-        self._cache[key] = now
-        self._cache.move_to_end(key)
-        # Evict oldest entries beyond maxlen
-        while len(self._cache) > self._maxlen:
-            self._cache.popitem(last=False)
-        return False
-
-
-_content_dedup = ContentDeduplicator()
-
-
-# ---------------------------------------------------------------------------
-# Persistent room message ID deduplication (survives daemon restarts)
-# ---------------------------------------------------------------------------
-
-class PersistentMsgIdDedup:
-    """
-    Persist seen room message IDs to disk so daemon restarts don't cause
-    re-delivery of the same messages. Works as a global second layer on top
-    of the per-room in-memory dedup sets.
-    """
-    def __init__(self, path: Path, maxlen: int = ROOM_MSG_ID_MAXLEN):
-        self._path = path
-        self._maxlen = maxlen
-        self._seen: collections.deque = collections.deque(maxlen=maxlen)
-        self._seen_set: set = set()
-        self._load()
-
-    def _load(self) -> None:
-        try:
-            if self._path.exists():
-                ids = json.loads(self._path.read_text())
-                for mid in ids[-self._maxlen:]:
-                    self._seen.append(mid)
-                    self._seen_set.add(mid)
-                log.info("MsgIdDedup: loaded %d seen IDs from %s", len(self._seen_set), self._path)
-        except Exception as e:
-            log.warning("MsgIdDedup: failed to load from %s: %s", self._path, e)
-
-    def _save(self) -> None:
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(json.dumps(list(self._seen)))
-        except Exception as e:
-            log.warning("MsgIdDedup: failed to save to %s: %s", self._path, e)
-
-    def is_duplicate(self, msg_id: str) -> bool:
-        """Return True if msg_id was already seen. Records and persists it if new."""
-        if msg_id in self._seen_set:
-            return True
-        self._seen.append(msg_id)
-        self._seen_set.add(msg_id)
-        while len(self._seen_set) > self._maxlen:
-            oldest = self._seen.popleft()
-            self._seen_set.discard(oldest)
-        self._save()
-        return False
-
-
-_DEDUP_PATH = Path.home() / ".openclaw" / "pincer-room-seen-ids.json"
-_msg_id_dedup = PersistentMsgIdDedup(_DEDUP_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -164,26 +66,6 @@ def load_config(path: str) -> dict:
 # ---------------------------------------------------------------------------
 # OpenClaw forwarding — invoke agent via CLI (#2 fix: session_key optional)
 # ---------------------------------------------------------------------------
-
-
-async def send_typing(cfg: dict, room_id: str, event: str) -> None:
-    """Send agent_replying / agent_replying_done to Pincer room typing endpoint."""
-    base_url = cfg["pincer_url"]
-    if base_url.startswith("ws"):
-        base_url = base_url.replace("wss://", "https://").replace("ws://", "http://")
-    base_url = base_url.rstrip("/ws").rstrip("/")
-    api_key = cfg["api_key"]
-    agent_id = cfg["agent_id"]
-    url = f"{base_url}/api/v1/rooms/{room_id}/typing"
-    body = json.dumps({"agent_id": agent_id, "event": event}).encode()
-    try:
-        req = _urllib_req.Request(url, data=body, headers={"X-API-Key": api_key, "Content-Type": "application/json"}, method="POST")
-        with _urllib_req.urlopen(req, timeout=5):
-            pass
-        log.debug("Typing event sent: %s → room %s", event, room_id[:8])
-    except Exception as e:
-        log.debug("Typing event failed (%s): %s", event, e)
-
 
 async def forward_to_agent(cfg: dict, message: str, dry_run: bool = False) -> None:
     """Trigger an OpenClaw agent session turn with `message` as input."""
@@ -234,17 +116,13 @@ async def forward_to_agent(cfg: dict, message: str, dry_run: bool = False) -> No
         log.warning("Session lookup failed: %s", e)
 
     try:
-        proc = await asyncio.create_subprocess_exec(
+        # Fire-and-forget — agent turns can take 30-120s; don't await
+        await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
         log.info("Forwarded to OpenClaw agent (background)")
-        # Wait for agent turn to complete (up to 180s)
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=180)
-        except asyncio.TimeoutError:
-            log.warning("Agent turn timed out after 180s")
     except FileNotFoundError:
         log.error("openclaw binary not found at: %s", bin_)
     except Exception as e:
@@ -420,24 +298,14 @@ async def handle_message(raw: str, cfg: dict, agent_id: str, ws, dry_run: bool,
         # From field is set by hub from the sender's WS connection — no sender_agent_id in payload
         from_id = msg.get("from", "?")
         text = payload.get("text", "")
-        _raw_url = cfg.get("pincer_url", "")
-        pincer_url = _raw_url.replace("ws://", "http://").replace("wss://", "https://")
-        if pincer_url.endswith("/ws"):
-            pincer_url = pincer_url[:-3]
+        pincer_url = cfg.get("pincer_url", "").replace("ws://", "http://").replace("wss://", "https://").removesuffix("/ws")
         log.info("💬 DM from %s: %s", from_id[:8], text[:80])
-        # Structured route header so agent can reliably parse routing info
-        route_header = (
-            f"[Pincer Route]\n"
-            f"type: dm\n"
-            f"from_agent_id: {from_id}\n"
-            f"my_agent_id: {agent_id}\n"
-        )
         reply_hint = (
-            f"\nTo reply via Pincer DM, POST to {pincer_url}/api/v1/messages/send:\n"
+            f"\nTo reply via Pincer, POST to {pincer_url}/api/v1/messages/send:\n"
             f'  {{"from_agent_id": "{agent_id}", "to_agent_id": "{from_id}", "payload": {{"text": "<reply>"}}}}\n'
             f"  Header: X-API-Key: {cfg.get('api_key', '')}"
         )
-        await forward_to_agent(cfg, f"{route_header}\n[Pincer DM from {from_id}]\n{text}{reply_hint}", dry_run)
+        await forward_to_agent(cfg, f"[Pincer DM from {from_id}]\n{text}{reply_hint}", dry_run)
 
     elif msg_type in ("broadcast", "BROADCAST"):
         from_id = msg.get("from", "hub")
@@ -481,33 +349,11 @@ async def run_daemon(cfg: dict, dry_run: bool = False) -> None:
     pincer_url = cfg["pincer_url"]
     result_dir = Path.home() / ".openclaw" / "pincer-results"
 
-    # Auto-discover room_id if not configured: GET /api/v1/rooms → first result
-    if not cfg.get("room_id", "").strip():
-        _raw = pincer_url.replace("wss://", "https://").replace("ws://", "http://")
-        _base = _raw[:-3] if _raw.endswith("/ws") else _raw
-        try:
-            req = _urllib_req.Request(
-                f"{_base}/api/v1/rooms",
-                headers={"X-API-Key": cfg["api_key"]},
-            )
-            with _urllib_req.urlopen(req, timeout=10) as resp:
-                rooms = json.loads(resp.read())
-            if rooms:
-                cfg["room_id"] = rooms[0]["id"]
-                log.info("Auto-discovered room_id: %s", cfg["room_id"])
-            else:
-                log.warning("No rooms found for this API key, room subscription skipped.")
-        except Exception as e:
-            log.warning("Could not auto-discover room_id: %s", e)
-
     t = threading.Thread(target=result_listener_thread, args=(result_dir,), daemon=True)
     t.start()
 
     # Run room WS loop concurrently (if room_id configured)
     room_task = asyncio.create_task(run_room_loop(cfg, dry_run))
-
-    # Run DM inbox poll loop (HTTP polling for reliable DM delivery)
-    inbox_task = asyncio.create_task(run_inbox_poll_loop(cfg, dry_run))
 
     reconnect_delay = RECONNECT_DELAY_BASE
     while True:
@@ -516,9 +362,6 @@ async def run_daemon(cfg: dict, dry_run: bool = False) -> None:
             if "agent_id=" not in connect_url:
                 sep = "&" if "?" in connect_url else "?"
                 connect_url = f"{connect_url}{sep}agent_id={agent_id}"
-            if "api_key=" not in connect_url:
-                sep = "&" if "?" in connect_url else "?"
-                connect_url = f"{connect_url}{sep}api_key={cfg['api_key']}"
             log.info("Connecting to %s ...", pincer_url)
 
             async with websockets.connect(connect_url, ping_interval=None, close_timeout=5) as ws:
@@ -563,105 +406,6 @@ async def run_daemon(cfg: dict, dry_run: bool = False) -> None:
         await room_task
     except asyncio.CancelledError:
         pass
-    inbox_task.cancel()
-    try:
-        await inbox_task
-    except asyncio.CancelledError:
-        pass
-
-
-async def run_inbox_poll_loop(cfg: dict, dry_run: bool = False) -> None:
-    """
-    HTTP inbox polling loop for reliable DM delivery.
-
-    Polls GET /api/v1/agents/{id}/inbox every inbox_poll_interval seconds.
-    Uses message IDs for deduplication to avoid double-forwarding.
-    This is the primary DM delivery path; WS MESSAGE events are supplementary.
-    """
-    agent_id = cfg["agent_id"]
-    api_key = cfg["api_key"]
-    base_url = cfg["pincer_url"].removesuffix("/ws").replace("wss://", "https://").replace("ws://", "http://")
-    poll_interval = cfg.get("inbox_poll_interval", 10)  # seconds, default 10s
-
-    seen_ids: collections.deque = collections.deque(maxlen=SEEN_MAXLEN)
-    seen_set: set = set()
-
-
-
-    log.info("DM inbox poll: starting (interval=%ds)", poll_interval)
-    while True:
-        try:
-            await asyncio.sleep(poll_interval)
-            loop = asyncio.get_event_loop()
-
-            def _fetch_inbox():
-                req = _urllib_req.Request(
-                    f"{base_url}/api/v1/agents/{agent_id}/inbox",
-                    headers={"X-API-Key": api_key, "User-Agent": "pincer-daemon/1.0"}
-                )
-                try:
-                    with _urllib_req.urlopen(req, timeout=10) as r:
-                        raw = r.read()
-                        if not raw or raw == b"null":
-                            return []
-                        data = json.loads(raw)
-                        return data if isinstance(data, list) else []
-                except Exception as e:
-                    log.warning("DM inbox poll error: %s", e)
-                    return []
-
-            msgs = await loop.run_in_executor(None, _fetch_inbox)
-            if not msgs:
-                continue
-
-            log.info("DM inbox: %d message(s)", len(msgs))
-            for m in msgs:
-                msg_id = m.get("id") or m.get("ID") or ""
-                if msg_id and msg_id in seen_set:
-                    log.debug("DM inbox: skipping duplicate %s", msg_id[:8])
-                    continue
-                if msg_id:
-                    seen_ids.append(msg_id)
-                    seen_set.add(msg_id)
-                    while len(seen_set) > SEEN_MAXLEN:
-                        oldest = seen_ids.popleft()
-                        seen_set.discard(oldest)
-
-                # Extract message content
-                from_id = m.get("from") or m.get("From") or m.get("sender_agent_id") or "?"
-                msg_type = (m.get("type") or m.get("Type") or "").lower()
-                payload_data = m.get("payload") or m.get("Payload") or {}
-                text = payload_data.get("text") or payload_data.get("content") or json.dumps(payload_data)
-
-                # Skip messages sent by self
-                if from_id == agent_id:
-                    continue
-
-                log.info("💬 DM inbox from %s (id=%s): %s", from_id[:8], msg_id[:8] if msg_id else "?", text[:80])
-
-                # Content dedup: skip if same sender sent same content recently
-                if _content_dedup.is_duplicate(from_id, text):
-                    log.warning("⚠️  DM inbox: duplicate content from %s, skipping (anti-loop)", from_id[:8])
-                    continue
-
-                route_header = (
-                    f"[Pincer Route]\n"
-                    f"type: dm\n"
-                    f"from_agent_id: {from_id}\n"
-                    f"my_agent_id: {agent_id}\n"
-                )
-                reply_hint = (
-                    f"\nTo reply via Pincer DM, POST to {base_url}/api/v1/messages/send:\n"
-                    f'  {{"from_agent_id": "{agent_id}", "to_agent_id": "{from_id}", "payload": {{"text": "<reply>"}}}}\n'
-                    f"  Header: X-API-Key: {api_key}"
-                )
-                await forward_to_agent(cfg, f"{route_header}\n[Pincer DM from {from_id}]\n{text}{reply_hint}", dry_run)
-
-        except asyncio.CancelledError:
-            log.info("DM inbox poll loop cancelled.")
-            return
-        except Exception as e:
-            log.warning("DM inbox poll loop error: %s", e)
 
 
 async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
@@ -682,16 +426,15 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
     mention_only = cfg.get("room_mention_only", True)
     context_window = cfg.get("room_context_window", 5)
 
-    _raw_base = cfg["pincer_url"].replace("wss://", "https://").replace("ws://", "http://")
-    base_url = _raw_base[:-3] if _raw_base.endswith("/ws") else _raw_base
+    base_url = cfg["pincer_url"].removesuffix("/ws").replace("wss://", "https://").replace("ws://", "http://")
 
     def _fetch_project_rooms() -> list[str]:
         """Return list of room_ids from /projects endpoint."""
-    
+        import urllib.request as _urllib
         try:
-            req = _urllib_req.Request(f"{base_url}/api/v1/projects",
+            req = _urllib.Request(f"{base_url}/api/v1/projects",
                 headers={"X-API-Key": api_key, "User-Agent": "pincer-daemon/1.0"})
-            with _urllib_req.urlopen(req, timeout=10) as r:
+            with _urllib.urlopen(req, timeout=10) as r:
                 data = json.loads(r.read())
             rooms = [p["room_id"] for p in (data if isinstance(data, list) else []) if p.get("room_id")]
             return rooms
@@ -701,11 +444,11 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
 
     def _fetch_default_rooms() -> list[str]:
         """Return room_ids from /rooms (legacy auto-discover)."""
-    
+        import urllib.request as _urllib
         try:
-            req = _urllib_req.Request(f"{base_url}/api/v1/rooms",
+            req = _urllib.Request(f"{base_url}/api/v1/rooms",
                 headers={"X-API-Key": api_key, "User-Agent": "pincer-daemon/1.0"})
-            with _urllib_req.urlopen(req, timeout=5) as r:
+            with _urllib.urlopen(req, timeout=5) as r:
                 data = json.loads(r.read())
             return [r["id"] for r in (data if isinstance(data, list) else []) if r.get("id")]
         except Exception as e:
@@ -722,9 +465,6 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
         ws_url = f"{base_url.replace('http://', 'ws://').replace('https://', 'wss://')}/api/v1/rooms/{room_id}/ws?api_key={api_key}"
         buf = context_bufs.setdefault(room_id, collections.deque(maxlen=max(context_window, 1)))
         reconnect_delay = RECONNECT_DELAY_BASE
-        # Per-room message-ID dedup (survives reconnects within same daemon run)
-        room_seen_ids: collections.deque = collections.deque(maxlen=SEEN_MAXLEN)
-        room_seen_set: set = set()
         log.info("Room WS: subscribing to room %s", room_id)
         while True:
             try:
@@ -740,23 +480,8 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
                         if msg_type != "room.message":
                             continue
                         data = msg.get("data") or msg.get("payload") or {}
-                        msg_id = data.get("id") or data.get("ID") or ""
                         sender = data.get("sender_agent_id", "unknown")
                         content = data.get("content", "")
-                        # Message-ID dedup layer 1: in-memory per-room (fast, survives reconnects)
-                        if msg_id and msg_id in room_seen_set:
-                            log.debug("Room %s: skipping duplicate msg_id %s", room_id[:8], msg_id[:8])
-                            continue
-                        # Message-ID dedup layer 2: persistent cross-restart global dedup
-                        if msg_id and _msg_id_dedup.is_duplicate(msg_id):
-                            log.debug("Room %s: skipping msg_id %s (persistent dedup)", room_id[:8], msg_id[:8])
-                            continue
-                        if msg_id:
-                            room_seen_ids.append(msg_id)
-                            room_seen_set.add(msg_id)
-                            while len(room_seen_set) > SEEN_MAXLEN:
-                                oldest = room_seen_ids.popleft()
-                                room_seen_set.discard(oldest)
                         if sender == agent_id:
                             buf.append(f"[{sender[:8]}(me)]: {content}")
                             continue
@@ -766,45 +491,16 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
                         if mention_only and not is_mentioned and not is_broadcast:
                             log.debug("💬 Room %s: ignored (no mention): %s", room_id[:8], content[:40])
                             continue
-                        log.info("💬 Room %s msg from %s (id=%s): %s", room_id[:8], sender[:8], msg_id[:8] if msg_id else "?", content[:60])
-                        # Content dedup: skip if same sender sent same content recently
-                        if _content_dedup.is_duplicate(sender, content):
-                            log.warning("⚠️  Room %s: duplicate content from %s, skipping (anti-loop)", room_id[:8], sender[:8])
-                            continue
-                        # Immediately push agent_replying so the sender sees the read receipt / typing indicator
-                        _typing_url = f"{base_url}/api/v1/rooms/{room_id}/typing"
-                        _typing_headers = {"X-API-Key": api_key, "Content-Type": "application/json", "User-Agent": "pincer-daemon/1.0"}
-
-                        async def _push_typing(event: str) -> None:
-                            try:
-                                _p = json.dumps({"agent_id": agent_id, "event": event}).encode()
-                                _req = _urllib_req.Request(_typing_url, data=_p, headers=_typing_headers, method="POST")
-                                await asyncio.get_event_loop().run_in_executor(
-                                    None, lambda: _urllib_req.urlopen(_req, timeout=5).close()
-                                )
-                                log.info("typing: pushed %s to room %s", event, room_id[:8])
-                            except Exception as _te:
-                                log.warning("typing: %s push failed: %s", event, _te)
-
-                        await _push_typing("agent_replying")
+                        log.info("💬 Room %s msg from %s: %s", room_id[:8], sender[:8], content[:60])
                         ctx_msgs = list(buf)[:-1]
-                        # Structured route header for reliable agent-side parsing
-                        route_header = (
-                            f"[Pincer Route]\n"
-                            f"type: room\n"
-                            f"room_id: {room_id}\n"
-                            f"from_agent_id: {sender}\n"
-                            f"my_agent_id: {agent_id}\n"
-                        )
                         if ctx_msgs and context_window > 0:
                             ctx_str = "\n".join(ctx_msgs)
                             forward_text = (
-                                f"{route_header}\n"
                                 f"[Pincer Room context (last {len(ctx_msgs)} msgs)]\n{ctx_str}\n\n"
                                 f"[Pincer Room msg from {sender}]\n{content}"
                             )
                         else:
-                            forward_text = f"{route_header}\n[Pincer Room msg from {sender}]\n{content}"
+                            forward_text = f"[Pincer Room msg from {sender}]\n{content}"
                         reply_hint = (
                             f"\nTo reply in this room, POST to {base_url}/api/v1/rooms/{room_id}/messages:\n"
                             f'  {{"sender_agent_id": "{agent_id}", "content": "<reply>"}}\n'
@@ -812,7 +508,6 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
                             f"Do NOT reply via Feishu or other messaging channels."
                         )
                         await forward_to_agent(cfg, forward_text + reply_hint, dry_run)
-                        # Note: agent_replying_done is pushed by the server when the agent's message is posted.
             except websockets.exceptions.ConnectionClosed as e:
                 log.warning("Room WS %s disconnected: %s. Retry in %ds...", room_id[:8], e, reconnect_delay)
             except OSError as e:
