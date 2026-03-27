@@ -666,6 +666,9 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
         ws_url = f"{base_url.replace('http://', 'ws://').replace('https://', 'wss://')}/api/v1/rooms/{room_id}/ws?api_key={api_key}"
         buf = context_bufs.setdefault(room_id, collections.deque(maxlen=max(context_window, 1)))
         reconnect_delay = RECONNECT_DELAY_BASE
+        # Per-room message-ID dedup (survives reconnects within same daemon run)
+        room_seen_ids: collections.deque = collections.deque(maxlen=SEEN_MAXLEN)
+        room_seen_set: set = set()
         log.info("Room WS: subscribing to room %s", room_id)
         while True:
             try:
@@ -681,8 +684,19 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
                         if msg_type != "room.message":
                             continue
                         data = msg.get("data") or msg.get("payload") or {}
+                        msg_id = data.get("id") or data.get("ID") or ""
                         sender = data.get("sender_agent_id", "unknown")
                         content = data.get("content", "")
+                        # Message-ID dedup: skip messages we've already processed this session
+                        if msg_id and msg_id in room_seen_set:
+                            log.debug("Room %s: skipping duplicate msg_id %s", room_id[:8], msg_id[:8])
+                            continue
+                        if msg_id:
+                            room_seen_ids.append(msg_id)
+                            room_seen_set.add(msg_id)
+                            while len(room_seen_set) > SEEN_MAXLEN:
+                                oldest = room_seen_ids.popleft()
+                                room_seen_set.discard(oldest)
                         if sender == agent_id:
                             buf.append(f"[{sender[:8]}(me)]: {content}")
                             continue
@@ -692,7 +706,7 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
                         if mention_only and not is_mentioned and not is_broadcast:
                             log.debug("💬 Room %s: ignored (no mention): %s", room_id[:8], content[:40])
                             continue
-                        log.info("💬 Room %s msg from %s: %s", room_id[:8], sender[:8], content[:60])
+                        log.info("💬 Room %s msg from %s (id=%s): %s", room_id[:8], sender[:8], msg_id[:8] if msg_id else "?", content[:60])
                         # Content dedup: skip if same sender sent same content recently
                         if _content_dedup.is_duplicate(sender, content):
                             log.warning("⚠️  Room %s: duplicate content from %s, skipping (anti-loop)", room_id[:8], sender[:8])
