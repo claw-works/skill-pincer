@@ -45,6 +45,7 @@ RECONNECT_DELAY_MAX = 60
 SEEN_MAXLEN = 1000        # max entries in result listener seen-set (#6)
 CONTENT_DEDUP_TTL = 600   # seconds: ignore same sender+content within this window
 CONTENT_DEDUP_MAXLEN = 500  # max entries in content dedup cache
+ROOM_MSG_ID_MAXLEN = 2000  # max room message IDs persisted for dedup across restarts
 
 # Result queue: agent writes results here, send loop picks them up
 _result_queue: queue.Queue = queue.Queue()
@@ -89,6 +90,58 @@ class ContentDeduplicator:
 
 
 _content_dedup = ContentDeduplicator()
+
+
+# ---------------------------------------------------------------------------
+# Persistent room message ID deduplication (survives daemon restarts)
+# ---------------------------------------------------------------------------
+
+class PersistentMsgIdDedup:
+    """
+    Persist seen room message IDs to disk so daemon restarts don't cause
+    re-delivery of the same messages. Works as a global second layer on top
+    of the per-room in-memory dedup sets.
+    """
+    def __init__(self, path: Path, maxlen: int = ROOM_MSG_ID_MAXLEN):
+        self._path = path
+        self._maxlen = maxlen
+        self._seen: collections.deque = collections.deque(maxlen=maxlen)
+        self._seen_set: set = set()
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if self._path.exists():
+                ids = json.loads(self._path.read_text())
+                for mid in ids[-self._maxlen:]:
+                    self._seen.append(mid)
+                    self._seen_set.add(mid)
+                log.info("MsgIdDedup: loaded %d seen IDs from %s", len(self._seen_set), self._path)
+        except Exception as e:
+            log.warning("MsgIdDedup: failed to load from %s: %s", self._path, e)
+
+    def _save(self) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(json.dumps(list(self._seen)))
+        except Exception as e:
+            log.warning("MsgIdDedup: failed to save to %s: %s", self._path, e)
+
+    def is_duplicate(self, msg_id: str) -> bool:
+        """Return True if msg_id was already seen. Records and persists it if new."""
+        if msg_id in self._seen_set:
+            return True
+        self._seen.append(msg_id)
+        self._seen_set.add(msg_id)
+        while len(self._seen_set) > self._maxlen:
+            oldest = self._seen.popleft()
+            self._seen_set.discard(oldest)
+        self._save()
+        return False
+
+
+_DEDUP_PATH = Path.home() / ".openclaw" / "pincer-room-seen-ids.json"
+_msg_id_dedup = PersistentMsgIdDedup(_DEDUP_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -687,9 +740,13 @@ async def run_room_loop(cfg: dict, dry_run: bool = False) -> None:
                         msg_id = data.get("id") or data.get("ID") or ""
                         sender = data.get("sender_agent_id", "unknown")
                         content = data.get("content", "")
-                        # Message-ID dedup: skip messages we've already processed this session
+                        # Message-ID dedup layer 1: in-memory per-room (fast, survives reconnects)
                         if msg_id and msg_id in room_seen_set:
                             log.debug("Room %s: skipping duplicate msg_id %s", room_id[:8], msg_id[:8])
+                            continue
+                        # Message-ID dedup layer 2: persistent cross-restart global dedup
+                        if msg_id and _msg_id_dedup.is_duplicate(msg_id):
+                            log.debug("Room %s: skipping msg_id %s (persistent dedup)", room_id[:8], msg_id[:8])
                             continue
                         if msg_id:
                             room_seen_ids.append(msg_id)
